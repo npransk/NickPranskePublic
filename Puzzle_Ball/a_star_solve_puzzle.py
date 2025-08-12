@@ -1,7 +1,7 @@
 import heapq
 from collections import deque
 
-# Define adjacency map for the dodecahedron puzzle
+# --- Adjacency Map ---
 adjacency_map = {
     0: [1, 5, 6, 8, 11],
     1: [0, 2, 5, 8, 9],
@@ -17,36 +17,30 @@ adjacency_map = {
     11: [0, 3, 5, 6, 10]
 }
 
-slots = ["black", "dark_blue", "light_blue", "light_green", "orange", "pink",
-         "purple", "red", "teal", "turquoise", "white", "yellow"]
+# --- Slot and Ball Definitions ---
+slots = ["Black", "Dark Blue", "Light Blue", "Light Green", "Orange", "Pink",
+         "Purple", "Red", "Teal", "Turquoise", "White", "Yellow"]
 
-balls = ["black", "dark_blue", "light_blue", "light_green", "orange", "pink",
-         "purple", "red", "teal", "turquoise", "yellow", "empty"]
+balls = ["Black", "Dark Blue", "Light Blue", "Light Green", "Orange", "Pink",
+         "Purple", "Red", "Teal", "Turquoise", "Yellow", "Empty"]
 
-# --- New: Interactive Initial State Input ---
-def get_initial_state(slots, balls):
-    print("\nSet up your puzzle by selecting which ball is in each slot.")
-    print("Available ball colors:")
-    for i, ball in enumerate(balls):
-        print(f"{i}: {ball}")
-
+# --- Input Function ---
+def getInitialState(slots, balls):
     initial_state = []
+    print("Please enter the ball color for each slot. Valid options are:")
+    print(", ".join(balls))
     for slot in slots:
         while True:
-            try:
-                choice = int(input(f"\nSelect the ball for the '{slot}' slot (enter number 0-{len(balls)-1}): "))
-                if 0 <= choice < len(balls):
-                    ball_color = balls[choice]
-                    initial_state.append((slot, ball_color))
-                    break
-                else:
-                    print(f"Invalid number. Please enter a number between 0 and {len(balls)-1}.")
-            except ValueError:
-                print("Invalid input. Please enter a valid number.")
+            ball_slot = input(f"Which ball is in the '{slot}' slot? ")
+            if ball_slot not in balls:
+                print(f"'{ball_slot}' is not a valid ball color. Please try again.")
+            else:
+                initial_state.append((slot, ball_slot))
+                break
     return initial_state
 
-# --- Solver Functions ---
-def compute_distances(adjacency_map):
+# --- Distance Computation ---
+def computeDistances(adjacency_map):
     distances = {}
     for start in adjacency_map:
         distances[start] = {}
@@ -62,30 +56,34 @@ def compute_distances(adjacency_map):
                 queue.append((neighbor, dist + 1))
     return distances
 
+# --- Heuristic ---
 def heuristic(state, goal, distances):
     total = 0
     for i, (slot, ball) in enumerate(state):
-        if ball == "empty" or ball == slot:
+        if ball.lower() == "empty" or ball == slot:
             continue
         goal_index = next(j for j, (s, _) in enumerate(goal) if s == ball)
         total += distances[i][goal_index]
     return total
 
-def find_empty(state):
+# --- Find Empty Slot ---
+def findEmpty(state):
     for i, (_, ball) in enumerate(state):
-        if ball == "empty":
+        if ball.lower() == "empty":
             return i
     return -1
 
-def get_neighbors(state):
-    empty_index = find_empty(state)
+# --- Generate Neighbors ---
+def getNeighbors(state):
+    empty_index = findEmpty(state)
     neighbors = []
     for adj in adjacency_map[empty_index]:
         new_state = state.copy()
-        new_state[empty_index], new_state[adj] = (new_state[empty_index][0], new_state[adj][1]), (new_state[adj][0], "empty")
+        new_state[empty_index], new_state[adj] = (new_state[empty_index][0], new_state[adj][1]), (new_state[adj][0], "Empty")
         neighbors.append((new_state, adj))
     return neighbors
-def a_star(start, goal, distances):
+# --- A* Search ---
+def aStar(start, goal, distances):
     frontier = []
     heapq.heappush(frontier, (heuristic(start, goal, distances), 0, start, []))
     visited = set()
@@ -100,31 +98,33 @@ def a_star(start, goal, distances):
         if current == goal:
             return path + [current]
 
-        for neighbor, moved_index in get_neighbors(current):
+        for neighbor, moved_index in getNeighbors(current):
             new_path = path + [current]
             heapq.heappush(frontier, (cost + 1 + heuristic(neighbor, goal, distances), cost + 1, neighbor, new_path))
     return None
 
-def generate_instructions(solution_path):
+# --- Instructions ---
+def generateInstructions(solution_path):
     instructions = []
     for i in range(1, len(solution_path)):
         prev = solution_path[i-1]
         curr = solution_path[i]
-        empty_prev = find_empty(prev)
-        empty_curr = find_empty(curr)
+        empty_prev = findEmpty(prev)
+        empty_curr = findEmpty(curr)
         moved_ball_color = prev[empty_curr][1]
         instructions.append(f"Step {i}: Move the {moved_ball_color} ball")
     return instructions
+
 # --- Main Execution ---
 if __name__ == "__main__":
-    initial_state = get_initial_state(slots, balls)
-    goal_state = [(slot, slot if slot != "white" else "empty") for slot in slots]
-    distances = compute_distances(adjacency_map)
-    solution_path = a_star(initial_state, goal_state, distances)
+    initial_state = getInitialState(slots, balls)
+    goal_state = [(slot, slot if slot != "White" else "Empty") for slot in slots]
+    distances = computeDistances(adjacency_map)
+    solution_path = aStar(initial_state, goal_state, distances)
 
     if solution_path:
         print("\nPuzzle Solved! Here's how to do it:")
-        instructions = generate_instructions(solution_path)
+        instructions = generateInstructions(solution_path)
         for instruction in instructions:
             print(instruction)
     else:

@@ -97,12 +97,18 @@ def generate_instructions(solution_path):
     return instructions
 
 # --- Streamlit UI ---
-st.title("Dodecahedron Puzzle Ball Solver")
+st.title("Nick Pranske's Puzzle Ball Solver")
 st.markdown("Select the current ball color for each slot:")
 
 user_input = []
 for slot in slots:
-    selected_ball = st.selectbox(f"{slot} slot", balls, key=slot)
+    default_index = balls.index(slot) if slot in balls else 0
+    selected_ball = st.selectbox(
+        f"{slot} slot",
+        balls,
+        index=default_index,
+        key=slot
+    )
     user_input.append((slot, selected_ball))
 
 if st.button("Solve"):

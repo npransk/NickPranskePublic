@@ -1,6 +1,0 @@
-gym
-stable_baselines3
-shimmy>=2.0
-tensorflow
-keras
-keras-rl2

@@ -1,2 +1,2 @@
 # NickPranskePublic
-Nick Pranske's public portfolio/repository intended to display any projects he has/is/wants to work on in the future. Welcome!
+Nick Pranske's public portfolio/repository intended to display any projects he has completed or is working on. Welcome!

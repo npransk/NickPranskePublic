@@ -18,11 +18,11 @@ adjacency_map = {
     11: [0, 3, 5, 6, 10]
 }
 
-slots = ["black", "dark_blue", "light_blue", "light_green", "orange", "pink",
-         "purple", "red", "teal", "turquoise", "white", "yellow"]
+slots = ["Black", "Dark Blue", "Light Blue", "Light Green", "Orange", "Pink",
+         "Purple", "Red", "Teal", "Turquoise", "White", "Yellow"]
 
-balls = ["black", "dark_blue", "light_blue", "light_green", "orange", "pink",
-         "purple", "red", "teal", "turquoise", "yellow", "empty"]
+balls = ["Black", "Dark Blue", "Light Blue", "Light Green", "Orange", "Pink",
+         "Purple", "Red", "Teal", "Turquoise", "Yellow", "Empty"]
 
 # --- Solver Functions ---
 def compute_distances(adjacency_map):

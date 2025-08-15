@@ -131,7 +131,7 @@ balls[balls.index("White")] = "Empty"
 # Uncomment one of the following to test
 
 # Option 1: User input
-# initial_state = getInitialState(slots)
+# initial_state = getInitialState(slots, balls)
 
 # Option 2: Test version
 # initial_state = [

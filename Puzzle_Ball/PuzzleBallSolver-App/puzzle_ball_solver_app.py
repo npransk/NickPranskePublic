@@ -2,7 +2,7 @@ import streamlit as st
 import heapq
 from collections import deque
 
-# --- Puzzle Setup ---
+# --- Adjacency Map ---
 adjacency_map = {
     0: [1, 5, 6, 8, 11],
     1: [0, 2, 5, 8, 9],
@@ -18,14 +18,15 @@ adjacency_map = {
     11: [0, 3, 5, 6, 10]
 }
 
+# --- Slot and Ball Definitions ---
 slots = ["Black", "Dark Blue", "Light Blue", "Light Green", "Orange", "Pink",
          "Purple", "Red", "Teal", "Turquoise", "White", "Yellow"]
 
 balls = ["Black", "Dark Blue", "Light Blue", "Light Green", "Orange", "Pink",
          "Purple", "Red", "Teal", "Turquoise", "Yellow", "Empty"]
 
-# --- Solver Functions ---
-def compute_distances(adjacency_map):
+# --- Distance Computation ---
+def computeDistances(adjacency_map):
     distances = {}
     for start in adjacency_map:
         distances[start] = {}
@@ -41,31 +42,38 @@ def compute_distances(adjacency_map):
                 queue.append((neighbor, dist + 1))
     return distances
 
+# --- Heuristic ---
 def heuristic(state, goal, distances):
     total = 0
     for i, (slot, ball) in enumerate(state):
-        if ball == "empty" or ball == slot:
+        if ball.lower() == "empty" or ball == slot:
             continue
         goal_index = next(j for j, (s, _) in enumerate(goal) if s == ball)
         total += distances[i][goal_index]
     return total
 
-def find_empty(state):
+# --- Find Empty Slot ---
+def findEmpty(state):
     for i, (_, ball) in enumerate(state):
-        if ball == "empty":
+        if ball.lower() == "empty":
             return i
     return -1
 
-def get_neighbors(state):
-    empty_index = find_empty(state)
+# --- Generate Neighbors ---
+def getNeighbors(state):
+    empty_index = findEmpty(state)
     neighbors = []
     for adj in adjacency_map[empty_index]:
         new_state = state.copy()
-        new_state[empty_index], new_state[adj] = (new_state[empty_index][0], new_state[adj][1]), (new_state[adj][0], "empty")
+        new_state[empty_index], new_state[adj] = (
+            (new_state[empty_index][0], new_state[adj][1]),
+            (new_state[adj][0], "Empty")
+        )
         neighbors.append((new_state, adj))
     return neighbors
 
-def a_star(start, goal, distances):
+# --- A* Search ---
+def aStar(start, goal, distances):
     frontier = []
     heapq.heappush(frontier, (heuristic(start, goal, distances), 0, start, []))
     visited = set()
@@ -80,18 +88,22 @@ def a_star(start, goal, distances):
         if current == goal:
             return path + [current]
 
-        for neighbor, moved_index in get_neighbors(current):
+        for neighbor, moved_index in getNeighbors(current):
             new_path = path + [current]
-            heapq.heappush(frontier, (cost + 1 + heuristic(neighbor, goal, distances), cost + 1, neighbor, new_path))
+            heapq.heappush(
+                frontier,
+                (cost + 1 + heuristic(neighbor, goal, distances), cost + 1, neighbor, new_path)
+            )
     return None
 
-def generate_instructions(solution_path):
+# --- Instructions ---
+def generateInstructions(solution_path):
     instructions = []
     for i in range(1, len(solution_path)):
-        prev = solution_path[i-1]
+        prev = solution_path[i - 1]
         curr = solution_path[i]
-        empty_prev = find_empty(prev)
-        empty_curr = find_empty(curr)
+        empty_prev = findEmpty(prev)
+        empty_curr = findEmpty(curr)
         moved_ball_color = prev[empty_curr][1]
         instructions.append(f"Step {i}: Move the {moved_ball_color} ball")
     return instructions
@@ -112,13 +124,13 @@ for slot in slots:
     user_input.append((slot, selected_ball))
 
 if st.button("Solve"):
-    goal_state = [(slot, slot if slot != "white" else "empty") for slot in slots]
-    distances = compute_distances(adjacency_map)
-    solution_path = a_star(user_input, goal_state, distances)
+    goal_state = [(slot, slot if slot != "White" else "Empty") for slot in slots]
+    distances = computeDistances(adjacency_map)
+    solution_path = aStar(user_input, goal_state, distances)
 
     if solution_path:
         st.success("Puzzle Solved! Here's how to do it:")
-        instructions = generate_instructions(solution_path)
+        instructions = generateInstructions(solution_path)
         for instruction in instructions:
             st.write(instruction)
     else:

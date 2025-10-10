@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 # Config
 # ---------------------------
 DATA_DIR = "data"
-BOOK_FILE = os.path.join(DATA_DIR, "The Shadow and the Stag.epub")  # or change to .pdf if using PDF
+BOOK_FILE = os.path.join(DATA_DIR, "book.epub")
 CHUNKS_FILE = os.path.join(DATA_DIR, "chunks.json")
 EMBED_FILE = os.path.join(DATA_DIR, "embeddings.npy")
 

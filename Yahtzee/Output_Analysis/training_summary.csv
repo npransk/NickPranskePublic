@@ -1,0 +1,2 @@
+total_episodes,final_mean,final_median,final_std,final_max,over_200,over_250,improvement,final_epsilon,final_lr
+50000,168.917,173.0,29.713380756756646,257,141,2,73.54047999999999,0.0099993992244215,1.25e-05

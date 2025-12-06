@@ -1,0 +1,7 @@
+streamlit
+ebooklib
+beautifulsoup4
+sentence-transformers
+transformers
+torch
+numpy

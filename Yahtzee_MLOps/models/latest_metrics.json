@@ -1,0 +1,28 @@
+{
+  "games": 500.0,
+  "mean_score": 180.566,
+  "median_score": 174.0,
+  "std_score": 63.759812138995514,
+  "min_score": 60.0,
+  "max_score": 490.0,
+  "over_200_rate": 0.324,
+  "over_250_rate": 0.106,
+  "training_mode": "heuristic_imitation",
+  "teacher_episodes": 2000,
+  "training_examples": 102204,
+  "epochs": 3,
+  "agent_config": {
+    "hidden_size": 128,
+    "gamma": 0.99,
+    "learning_rate": 0.0001,
+    "batch_size": 256,
+    "replay_capacity": 200000,
+    "min_replay_size": 5000,
+    "target_update_every": 1000,
+    "epsilon_start": 0.0,
+    "epsilon_min": 0.0,
+    "epsilon_decay": 0.99995,
+    "seed": 42
+  },
+  "mean_imitation_loss": 0.6054408619180321
+}

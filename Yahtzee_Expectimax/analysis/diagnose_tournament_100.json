@@ -1,0 +1,78 @@
+{
+  "games": 100,
+  "mean_score": 238.61,
+  "median_score": 220.5,
+  "std_score": 58.53749140508158,
+  "min_score": 141,
+  "max_score": 420,
+  "over_240_rate": 0.37,
+  "upper_bonus_rate": 0.25,
+  "elapsed_seconds": 90.3553288000403,
+  "category_summary": {
+    "ones": {
+      "mean": 5.84,
+      "zero_rate": 0.16,
+      "count": 100
+    },
+    "twos": {
+      "mean": 10.91,
+      "zero_rate": 0.04,
+      "count": 100
+    },
+    "threes": {
+      "mean": 8.45,
+      "zero_rate": 0.01,
+      "count": 100
+    },
+    "fours": {
+      "mean": 11.23,
+      "zero_rate": 0.0,
+      "count": 100
+    },
+    "fives": {
+      "mean": 14.6,
+      "zero_rate": 0.0,
+      "count": 100
+    },
+    "sixes": {
+      "mean": 16.26,
+      "zero_rate": 0.0,
+      "count": 100
+    },
+    "three_of_kind": {
+      "mean": 22.73,
+      "zero_rate": 0.0,
+      "count": 100
+    },
+    "four_of_kind": {
+      "mean": 22.49,
+      "zero_rate": 0.33,
+      "count": 100
+    },
+    "full_house": {
+      "mean": 19.25,
+      "zero_rate": 0.26,
+      "count": 100
+    },
+    "small_straight": {
+      "mean": 30.0,
+      "zero_rate": 0.0,
+      "count": 100
+    },
+    "large_straight": {
+      "mean": 34.4,
+      "zero_rate": 0.14,
+      "count": 100
+    },
+    "yahtzee": {
+      "mean": 21.0,
+      "zero_rate": 0.58,
+      "count": 100
+    },
+    "chance": {
+      "mean": 21.45,
+      "zero_rate": 0.0,
+      "count": 100
+    }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "games": 200.0,
+  "mean_score": 116.185,
+  "median_score": 113.0,
+  "std_score": 16.8944006996401,
+  "min_score": 82.0,
+  "max_score": 225.0,
+  "over_200_rate": 0.005,
+  "over_250_rate": 0.0,
+  "episodes": 1000,
+  "epsilon": 0.06226744958526227,
+  "train_config": {
+    "episodes": 1000,
+    "eval_games": 200,
+    "train_every_steps": 4,
+    "seed": 42,
+    "model_dir": "models"
+  },
+  "agent_config": {
+    "hidden_size": 128,
+    "gamma": 0.99,
+    "learning_rate": 0.0001,
+    "batch_size": 64,
+    "replay_capacity": 200000,
+    "min_replay_size": 500,
+    "target_update_every": 1000,
+    "epsilon_start": 1.0,
+    "epsilon_min": 0.03,
+    "epsilon_decay": 0.9997,
+    "seed": 42
+  }
+}

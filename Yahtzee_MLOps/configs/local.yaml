@@ -1,0 +1,8 @@
+# This file is intentionally simple so it can be replaced by Hydra, MLflow, or
+# cloud config later.
+telemetry_db: data/gameplay.sqlite3
+model_dir: models
+min_new_events: 100
+episodes_per_run: 2000
+eval_games: 100
+seed: 42

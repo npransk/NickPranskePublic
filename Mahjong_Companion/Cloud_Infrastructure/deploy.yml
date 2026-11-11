@@ -1,0 +1,58 @@
+# Showcase copy of .github/workflows/deploy.yml from the private mahjong-companion repo. Here to be read, not run.
+# It sits outside .github/workflows on purpose, so GitHub never runs it from this repository.
+
+name: Deploy
+
+# Builds the image, pushes it to ghcr.io and points the Container App at it.
+# Infra changes are deployed by hand with Bicep (infra/README.md).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One deploy at a time: Azure rejects an update while another is in progress, which happened
+# when several PRs were merged within a minute. A newer run waits; only the newest queued one runs.
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+env:
+  IMAGE: ghcr.io/npransk/mahjong-companion
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/api/Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+
+      # OIDC sign-in: no Azure secret is stored in GitHub. IDs are repo variables, not secrets.
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - run: >
+          az containerapp update
+          -g ${{ vars.AZURE_RESOURCE_GROUP }}
+          -n ${{ vars.AZURE_CONTAINER_APP }}
+          --image ${{ env.IMAGE }}:${{ github.sha }}

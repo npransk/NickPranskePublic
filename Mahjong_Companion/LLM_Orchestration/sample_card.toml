@@ -1,0 +1,21 @@
+# Showcase copy of packages/engine/tests/sample_card.toml from the private mahjong-companion repo. Here to be read, not run.
+
+# Made-up hands for tests. Not from any NMJL card.
+year = 1999
+
+[[section]]
+name = "Sample Like Numbers"
+code = "LIKE"
+hands = [
+  { pattern = "FF iiii:g iiii:r iiii:b", vars = { i = "1-9" }, note = "Any 3 Suits", value = 25 },
+  { pattern = "NEWS iii:g DDD:g ii:r DD:r", vars = { i = "1-9" }, note = "Any 2 Suits", value = 30, concealed = true },
+]
+
+[[section]]
+name = "Sample Runs"
+code = "RUN"
+hands = [
+  { pattern = "iii:b jjj:b kkkk:b = DDDD:r -or- ii:g jjj:g kkkk:g FFFFF", vars = { i = "1-7", j = "i+1", k = "i+2" }, value = 25 },
+  { pattern = "iiiii:g wwww jjjjj:r", vars = { i = "1-9", j = "1-9", w = "NEWS" }, distinct = ["i", "j"], value = 40 },
+  { pattern = "FF 2468:g 2468:r 2468:b", value = 50, concealed = true },
+]

@@ -2,11 +2,21 @@
 
 #### Created by Nick Pranske
 
-A phone-sized assistant that sits next to my rack when I play American Mahjong. It reads my tiles from a photo, listens to the table and logs every discard, shows which hands on the card I am closest to, and when I ask, an LLM agent picks one to go for and tells me why.
+My wife has gotten really into Mahjong lately. It's a game that we get to play together and introduce to friends who have never played it! It's really quite fun - the only problem is that **she usually beats me!** Well, that ends today. I built this app as a table-side companion to help me strategize and win against her.
 
-I built it as a portfolio project for three things: **LLM agent orchestration**, **AI observability** and **cloud infrastructure**. This page walks through each of them.
+This project is also one of my first experiences in heavily relying on AI to do most of the programming. There were defintely ups and downs of this.
 
-> **What this folder is.** A showcase to read, not an app to run. The real app lives in a private repository and runs in Azure behind a sign-in that admits one account. Published here are this write-up, screenshots, and the actual source files for the AI, observability and infrastructure layers. There are no keys anywhere in it: see [What is not here, and why](#what-is-not-here-and-why).
+##### The Pros:
+1. Development was rapid and code is insanely organized (more on that in the cons)
+2. Organization of this repository was very easy
+3. Ability to iterate and improve was made much easier
+
+##### The Cons:
+1. My understanding of the project got out of hand as development quickly grew. This caused me to have to *read* code more than *write* it.
+2. Ultra-optimization of the code makes it harder for me to read.
+
+
+I built this both as a way to one-up my wife and as a portfolio project to showcase certain skills: **LLM agent orchestration**, **AI observability** and **cloud infrastructure**. This page walks through each of them. I had Claude organize this page to help the reader understand the architecture. This took a lot of iterations and input on my end, and I'm quite pleased with the accuracy of the result.
 
 <table>
   <tr>

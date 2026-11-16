@@ -52,20 +52,6 @@ class FakeClaude:
         return self.responses.pop(0)
 
 
-@pytest.fixture(autouse=True)
-def no_langfuse(monkeypatch):
-    for name in (
-        "LANGFUSE_PUBLIC_KEY",
-        "LANGFUSE_SECRET_KEY",
-        "LANGFUSE_PUBLIC_KEY_MJ",
-        "LANGFUSE_SECRET_KEY_MJ",
-        "LANGFUSE_BASE_URL",
-        "LANGFUSE_HOST",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    strategist.langfuse_client.cache_clear()
-
-
 @pytest.fixture
 def state():
     game = Game(players=2, dealer=2)
@@ -130,6 +116,116 @@ def test_a_refusal_is_an_error(card, state):
         strategist.ask(FakeClaude(refusal), card, state, "game-1")
 
 
+def test_an_ask_is_traced_with_everything_it_was_based_on(card, state, langfuse):
+    claude = FakeClaude(
+        tool_call("opponent_reads"),
+        tool_call("hand_details", hand_id="1999-LIKE-1"),
+        tool_call("submit_pick", hand_id="1999-LIKE-1", reason="Go for like 3s: you hold nine."),
+    )
+    pick = strategist.ask(claude, card, state, "game-1")
+    assert pick.trace_id == langfuse.trace_id
+    (agent,) = langfuse.named("strategist")
+    # The situation and the engine's numbers are on the trace, so a judge needs nothing else.
+    assert "Your tiles (13)" in agent["input"]["situation"]
+    assert agent["input"]["candidates"][0]["hand_id"] == "1999-LIKE-1"
+    assert agent["output"] == {
+        "hand_id": "1999-LIKE-1",
+        "label": "Sample Like Numbers, top line",
+        "reason": "Go for like 3s: you hold nine.",
+        "engine_rank": 1,
+    }
+    assert agent["metadata"] == {
+        "llm_calls": 3,
+        "tool_calls": 2,
+        "rejected_picks": 0,
+        "nudges": 0,
+        "outcome": "picked",
+    }
+    calls = langfuse.named("claude")
+    assert [c["metadata"]["round"] for c in calls] == [1, 2, 3]
+    assert calls[0]["input"][0] == {"role": "system", "content": strategist.SYSTEM}
+    assert calls[0]["metadata"]["stop_reason"] == "tool_use"
+    assert calls[0]["usage_details"]["input"] == 1000
+    assert [o["name"] for o in langfuse.observations if o["as_type"] == "tool"] == [
+        "opponent_reads",
+        "hand_details",
+    ]
+    assert langfuse.flushed == 1
+
+
+def test_an_ask_is_scored_by_checks_that_need_no_judgment(card, state, langfuse):
+    claude = FakeClaude(
+        tool_call("opponent_reads"),
+        tool_call("submit_pick", hand_id="2024-MADE-UP-9", reason="..."),
+        tool_call("submit_pick", hand_id="1999-LIKE-1", reason="Go for like 3s: you hold nine."),
+    )
+    strategist.ask(claude, card, state, "game-1")
+    assert langfuse.score("strategist_outcome") == "picked"
+    assert langfuse.score("pick_engine_rank") == 1
+    assert langfuse.score("reason_words") == 7
+    assert langfuse.score("reason_within_limit") == 1.0
+    assert langfuse.score("strategist_llm_calls") == 3
+    assert langfuse.score("strategist_tool_calls") == 1
+    assert langfuse.score("strategist_rejected_picks") == 1  # the made-up hand
+    # One score of each kind per ask: asking Langfuse again would overwrite, not add.
+    ids = [s["score_id"] for s in langfuse.scores]
+    assert len(ids) == len(set(ids)) == 7
+    assert all(s["trace_id"] == langfuse.trace_id for s in langfuse.scores)
+    rejected = [o for o in langfuse.named("submit_pick")]
+    assert rejected[0]["level"] == "WARNING"
+
+
+def test_a_reason_over_the_word_limit_is_flagged(card, state, langfuse):
+    rambling = " ".join(["word"] * (strategist.REASON_WORDS + 1))
+    claude = FakeClaude(tool_call("submit_pick", hand_id="1999-RUN-1", reason=rambling))
+    strategist.ask(claude, card, state, "game-1")
+    assert langfuse.score("reason_within_limit") == 0.0
+    assert langfuse.score("reason_words") == strategist.REASON_WORDS + 1
+    assert langfuse.score("pick_engine_rank") > 1  # not the engine's closest hand
+
+
+@pytest.mark.parametrize(
+    "responses, outcome",
+    [
+        ([SimpleNamespace(content=[], stop_reason="refusal", usage=usage())], "refused"),
+        ([tool_call("opponent_reads")] * strategist.MAX_CALLS, "no_pick"),
+    ],
+)
+def test_an_ask_without_a_pick_is_scored_and_marked_as_an_error(
+    card, state, langfuse, responses, outcome
+):
+    with pytest.raises(strategist.StrategistError):
+        strategist.ask(FakeClaude(*responses), card, state, "game-1")
+    assert langfuse.score("strategist_outcome") == outcome
+    assert "pick_engine_rank" not in langfuse.score_names()
+    (agent,) = langfuse.named("strategist")
+    assert agent["level"] == "ERROR"
+    assert agent["metadata"]["outcome"] == outcome
+    assert langfuse.flushed == 1
+
+
+def test_the_api_failing_is_scored_as_an_error_and_still_raised(card, state, langfuse):
+    class Down:
+        def __init__(self):
+            self.beta = SimpleNamespace(messages=SimpleNamespace(create=self._create))
+
+        def _create(self, **request):
+            raise ConnectionError("no route to the API")
+
+    with pytest.raises(ConnectionError):
+        strategist.ask(Down(), card, state, "game-1")
+    assert langfuse.score("strategist_outcome") == "error"
+    assert langfuse.score("strategist_llm_calls") == 1
+    assert langfuse.named("claude")[0]["level"] == "ERROR"
+    assert "ConnectionError" in langfuse.named("strategist")[0]["status_message"]
+
+
+def test_the_prompt_version_changes_with_the_prompt():
+    before = strategist.PROMPT_VERSION
+    assert before == strategist.prompt_version(strategist.SYSTEM, strategist.TOOLS)
+    assert before != strategist.prompt_version(strategist.SYSTEM + " Be brief.", strategist.TOOLS)
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     (tmp_path / "cards").mkdir()
@@ -167,3 +263,15 @@ def test_feedback_is_recorded(client):
     assert client.post(f"/api/games/{game_id}/strategist/feedback", json=body).json() == {
         "recorded": True
     }
+
+
+def test_feedback_is_one_score_per_ask_that_a_change_of_mind_overwrites(client, langfuse):
+    game_id = started_game(client)
+    for followed in (True, False):
+        body = {"trace_id": "0" * 32, "hand_id": "1999-LIKE-1", "followed": followed}
+        client.post(f"/api/games/{game_id}/strategist/feedback", json=body)
+    first, second = langfuse.scores
+    assert (first["name"], first["data_type"]) == ("recommendation_followed", "BOOLEAN")
+    assert [first["value"], second["value"]] == [1.0, 0.0]
+    assert first["score_id"] == second["score_id"]
+    assert first["metadata"] == {"game": game_id, "hand_id": "1999-LIKE-1"}

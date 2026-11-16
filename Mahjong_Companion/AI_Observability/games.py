@@ -18,16 +18,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from mahjong_engine.calls import CallOption, call_options
 from mahjong_engine.card import Card, card_from_dict
-from mahjong_engine.game import ME, Game, GameError, GameState, advise
+from mahjong_engine.game import ME, Game, GameError, GameState, advise, rank
 from mahjong_engine.odds import Exposure, HandOdds
 from mahjong_engine.reads import Read, read_opponent
 from mahjong_engine.tiles import Tile
 from pydantic import BaseModel, Field
 
 from mahjong_api import jev, listen, playbyplay, strategist, vision
+from mahjong_api.observability import flush, langfuse_client, record_score
 from mahjong_api.store import Store, store_from_env
 
 router = APIRouter(prefix="/api/games")
@@ -202,16 +203,17 @@ class Feedback(BaseModel):
 
 @router.post("/{game_id}/strategist/feedback")
 def strategist_feedback(game_id: str, body: Feedback) -> dict[str, bool]:
-    """Record whether the player went for the strategist's pick, as a Langfuse score."""
-    langfuse = strategist.langfuse_client()
-    langfuse.create_score(
-        name="recommendation_followed",
-        value=1.0 if body.followed else 0.0,
-        data_type="BOOLEAN",
+    """Record whether the player went for the strategist's pick, as a Langfuse score. One per
+    ask: changing your mind overwrites it."""
+    record_score(
+        langfuse_client(),
+        "recommendation_followed",
+        body.followed,
         trace_id=body.trace_id,
+        score_id=f"{body.trace_id}-recommendation_followed",
         metadata={"game": game_id, "hand_id": body.hand_id},
     )
-    langfuse.flush()
+    flush()
     return {"recorded": True}
 
 
@@ -276,10 +278,17 @@ class Line(BaseModel):
 
 @router.post("/{game_id}/heard")
 def heard(
-    game_id: str, body: Line, store: StoreDep, jev_client: Annotated[Any, Depends(jev.get_jev)]
+    game_id: str,
+    body: Line,
+    store: StoreDep,
+    jev_client: Annotated[Any, Depends(jev.get_jev)],
+    background: BackgroundTasks,
 ) -> dict[str, Any]:
     """Propose the event a line of table talk most likely means, for one-tap confirm or fix."""
-    return listen.hear(_load(store, game_id).state(), body.text, game_id, jev_client)
+    proposal = listen.hear(_load(store, game_id).state(), body.text, game_id, jev_client)
+    # The trace goes to Langfuse after the reply: the next heard line is waiting on this one.
+    background.add_task(listen.flush)
+    return proposal
 
 
 class HeardFeedback(BaseModel):
@@ -340,12 +349,13 @@ def _view(store: Store, game_id: str, game: Game) -> dict[str, Any]:
     card = load_card(store, my_card)
     advice = None
     if card is not None and state.my_tiles:
-        a = advise(card, state)
+        ranked = rank(card, state)  # once: the closest hands and the call advice both use it
+        a = advise(card, state, ranked=ranked)
         advice = {
             "hands": [_hand(h) for h in a.hands],
             "pass": _names(a.pass_tiles),
             "discard": str(a.discard) if a.discard else None,
-            "calls": [_call(c) for c in call_options(card, state)],
+            "calls": [_call(c) for c in call_options(card, state, ranked)],
         }
     last = state.last_discard
     return {

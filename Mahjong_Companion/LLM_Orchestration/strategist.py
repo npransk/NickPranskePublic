@@ -7,29 +7,47 @@ tools for a closer look, then weighs what the engine can't: what opponents seem 
 exposed a hand would be, which tiles are getting scarce. It must answer with ``submit_pick``,
 naming one of the candidates, so it can never invent a hand.
 
-One Langfuse trace per question (session = the game), with a generation per Claude call and a
-span per tool call. The player's "follow it" tap becomes the ``recommendation_followed`` score.
+One Langfuse trace per question (session = the game): an agent observation that holds the whole
+situation, a generation per Claude call and a tool observation per tool call (ADR 7). Checks that
+need no judgment are scored as soon as the answer is in: where the pick stood in the engine's
+ranking, whether the reason kept to its word limit, how many calls it took, how the ask ended.
+The player's "follow it" tap becomes ``recommendation_followed``, and the local judge adds its
+verdicts afterwards (``mahjong_api.judge``).
 """
 
 from __future__ import annotations
 
 import json
-import os
+import logging
 from collections import Counter
-from dataclasses import dataclass
-from functools import cache
+from dataclasses import asdict, dataclass
 from typing import Any
 
-from langfuse import Langfuse, get_client, propagate_attributes
 from mahjong_engine.card import Card
 from mahjong_engine.game import ME, GameState, advise
 from mahjong_engine.odds import HandOdds, closest_variants
 from mahjong_engine.tiles import TileKind
 
+from mahjong_api.observability import (
+    flush,
+    langfuse_client,
+    marking_errors,
+    prompt_link,
+    prompt_version,
+    record_claude,
+    record_score,
+    trace,
+)
+
+log = logging.getLogger(__name__)
+
 MODEL = "claude-sonnet-5-5"
 EFFORT = "low"
 MAX_CALLS = 4
+MAX_TOKENS = 4096
 CANDIDATES = 5
+REASON_WORDS = 25  # the limit the prompt sets; scored as reason_within_limit
+PROMPT_NAME = "strategist"
 
 SYSTEM = """You advise one player (Player 1, "you") in a game of American Mahjong played with \
 the NMJL card. A rules engine has already counted everything: for each candidate hand on the \
@@ -89,23 +107,8 @@ TOOLS = [
 ]
 
 
-@cache
-def langfuse_client() -> Langfuse:
-    """The Langfuse client for this app's project.
-
-    ``LANGFUSE_PUBLIC_KEY_MJ`` / ``LANGFUSE_SECRET_KEY_MJ`` win when set, so a machine whose
-    plain ``LANGFUSE_*`` keys belong to another project (Claude Code tracing) still traces here.
-    In Azure the plain names come from Key Vault.
-    """
-    public_key = os.environ.get("LANGFUSE_PUBLIC_KEY_MJ")
-    if not public_key:
-        return get_client()
-    Langfuse(
-        public_key=public_key,
-        secret_key=os.environ.get("LANGFUSE_SECRET_KEY_MJ"),
-        base_url=os.environ.get("LANGFUSE_BASE_URL"),
-    )
-    return get_client(public_key=public_key)
+# Changes whenever the instructions or the tools do; on every strategist trace.
+PROMPT_VERSION = prompt_version(SYSTEM, TOOLS)
 
 
 class StrategistError(RuntimeError):
@@ -118,6 +121,20 @@ class Pick:
     label: str
     reason: str
     trace_id: str | None
+    # What Claude looked up on the way (name, input, output), for judging the reason later.
+    tools: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass
+class _Tally:
+    """What one ask did, for its trace and scores. The outcome stays "error" unless the loop
+    reaches one of its own endings."""
+
+    llm_calls: int = 0
+    tool_calls: int = 0
+    rejected_picks: int = 0  # submit_pick naming a hand outside the candidates
+    nudges: int = 0  # answered in text instead of a tool call
+    outcome: str = "error"  # picked, refused, no_pick, error
 
 
 def ask(client: Any, card: Card, state: GameState, game_id: str, reads: dict | None = None) -> Pick:
@@ -127,55 +144,150 @@ def ask(client: Any, card: Card, state: GameState, game_id: str, reads: dict | N
         raise StrategistError("No hand on the card is still possible")
     by_id = {c.hand.id: c for c in candidates}
     langfuse = langfuse_client()
-
-    with propagate_attributes(session_id=game_id, trace_name="strategist"):
-        with langfuse.start_as_current_observation(
-            name="strategist", as_type="agent", input={"candidates": list(by_id)}
-        ) as agent:
+    situation = _situation(state, candidates)
+    tally, pick, trace_id = _Tally(), None, None
+    try:
+        with (
+            trace(
+                "strategist",
+                game_id=game_id,
+                feature="strategist",
+                version=PROMPT_VERSION,
+                prompt=prompt_link(PROMPT_NAME, PROMPT_VERSION),
+                card=card.year,
+                players=state.players,
+                discards=len(state.all_discards),
+            ),
+            langfuse.start_as_current_observation(
+                name="strategist",
+                as_type="agent",
+                # Everything the answer was based on, so it can be judged from this alone.
+                input={"situation": situation, "candidates": [_odds(c) for c in candidates]},
+            ) as agent,
+            marking_errors(agent),
+        ):
             trace_id = langfuse.get_current_trace_id()
-            messages: list[dict[str, Any]] = [
-                {"role": "user", "content": _situation(state, candidates)}
-            ]
-            for _ in range(MAX_CALLS):
-                response = _call_claude(client, langfuse, messages)
-                if response.stop_reason == "refusal":
-                    raise StrategistError("The model declined to answer")
-                messages.append({"role": "assistant", "content": response.content})
-                results = []
-                for block in response.content:
-                    if block.type != "tool_use":
-                        continue
-                    if block.name == "submit_pick" and block.input.get("hand_id") in by_id:
-                        pick = Pick(
-                            block.input["hand_id"],
-                            by_id[block.input["hand_id"]].hand.label,
-                            block.input["reason"],
-                            trace_id,
-                        )
-                        agent.update(output={"hand_id": pick.hand_id, "reason": pick.reason})
-                        langfuse.flush()
-                        return pick
-                    results.append(_run_tool(langfuse, block, card, state, by_id, reads or {}))
-                if not results:
-                    # Answered in text instead of calling the tool: ask once more.
-                    results = [{"type": "text", "text": "Call submit_pick with your choice."}]
-                messages.append({"role": "user", "content": results})
-            agent.update(level="ERROR", status_message="No pick after the call limit")
-    langfuse.flush()
+            try:
+                pick = _decide(client, langfuse, card, state, by_id, reads or {}, situation, tally)
+            finally:
+                agent.update(metadata=asdict(tally))
+            agent.update(
+                output={
+                    "hand_id": pick.hand_id,
+                    "label": pick.label,
+                    "reason": pick.reason,
+                    "engine_rank": list(by_id).index(pick.hand_id) + 1,
+                }
+            )
+    finally:
+        _score(langfuse, trace_id, tally, pick, list(by_id))
+        flush()
+    return pick
+
+
+def _decide(
+    client: Any,
+    langfuse: Any,
+    card: Card,
+    state: GameState,
+    by_id: dict[str, HandOdds],
+    reads: dict,
+    situation: str,
+    tally: _Tally,
+) -> Pick:
+    """The tool loop: call Claude until it submits one of the candidates."""
+    messages: list[dict[str, Any]] = [{"role": "user", "content": situation}]
+    looked_up: list[dict[str, Any]] = []
+    for round_number in range(1, MAX_CALLS + 1):
+        tally.llm_calls += 1
+        response = _call_claude(client, langfuse, messages, round_number)
+        if response.stop_reason == "refusal":
+            tally.outcome = "refused"
+            raise StrategistError("The model declined to answer")
+        messages.append({"role": "assistant", "content": response.content})
+        results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            if block.name == "submit_pick":
+                if block.input.get("hand_id") in by_id:
+                    tally.outcome = "picked"
+                    return Pick(
+                        block.input["hand_id"],
+                        by_id[block.input["hand_id"]].hand.label,
+                        block.input["reason"],
+                        langfuse.get_current_trace_id(),
+                        tuple(looked_up),
+                    )
+                tally.rejected_picks += 1
+            else:
+                tally.tool_calls += 1
+            output = _run_tool(langfuse, block, card, state, by_id, reads)
+            if block.name != "submit_pick" and "error" not in output:
+                looked_up.append({"name": block.name, "input": block.input, "output": output})
+            results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(output),
+                    **({"is_error": True} if "error" in output else {}),
+                }
+            )
+        if not results:
+            # Answered in text instead of calling the tool: ask once more.
+            tally.nudges += 1
+            results = [{"type": "text", "text": "Call submit_pick with your choice."}]
+        messages.append({"role": "user", "content": results})
+    tally.outcome = "no_pick"
     raise StrategistError("The strategist didn't settle on a hand")
 
 
-def _call_claude(client: Any, langfuse: Any, messages: list[dict[str, Any]]) -> Any:
-    with langfuse.start_as_current_observation(
-        name="claude",
-        as_type="generation",
-        model=MODEL,
-        model_parameters={"effort": EFFORT},
-        input=_jsonable(messages),
-    ) as generation:
+def _score(
+    langfuse: Any, trace_id: str | None, tally: _Tally, pick: Pick | None, ranking: list[str]
+) -> None:
+    """The checks that need no judgment, one score each per ask. Never raises."""
+    if not trace_id:
+        return
+
+    def put(name: str, value: float | bool | str, comment: str | None = None) -> None:
+        record_score(
+            langfuse,
+            name,
+            value,
+            trace_id=trace_id,
+            score_id=f"{trace_id}-{name}",
+            comment=comment,
+        )
+
+    try:
+        put("strategist_outcome", tally.outcome)
+        put("strategist_llm_calls", tally.llm_calls)
+        put("strategist_tool_calls", tally.tool_calls)
+        put("strategist_rejected_picks", tally.rejected_picks)
+        if pick is not None:
+            words = len(pick.reason.split())
+            put("pick_engine_rank", ranking.index(pick.hand_id) + 1, comment=pick.hand_id)
+            put("reason_words", words)
+            put("reason_within_limit", words <= REASON_WORDS, comment=f"{words} words")
+    except Exception:
+        log.warning("Couldn't score a strategist ask", exc_info=True)
+
+
+def _call_claude(client: Any, langfuse: Any, messages: list[dict[str, Any]], round_number: int):
+    with (
+        langfuse.start_as_current_observation(
+            name="claude",
+            as_type="generation",
+            model=MODEL,
+            model_parameters={"effort": EFFORT, "max_tokens": MAX_TOKENS},
+            input=[{"role": "system", "content": SYSTEM}, *_jsonable(messages)],
+            metadata={"round": round_number, "tools": [tool["name"] for tool in TOOLS]},
+        ) as generation,
+        marking_errors(generation),
+    ):
         response = client.beta.messages.create(
             model=MODEL,
-            max_tokens=4096,
+            max_tokens=MAX_TOKENS,
             system=SYSTEM,
             tools=TOOLS,
             messages=messages,
@@ -185,22 +297,14 @@ def _call_claude(client: Any, langfuse: Any, messages: list[dict[str, Any]]) -> 
             betas=["server-side-fallback-2026-07-01"],
             fallbacks="default",
         )
-        usage = response.usage
-        generation.update(
-            output=_jsonable(response.content),
-            usage_details={
-                "input": usage.input_tokens,
-                "output": usage.output_tokens,
-                "cache_read_input_tokens": usage.cache_read_input_tokens or 0,
-                "cache_creation_input_tokens": usage.cache_creation_input_tokens or 0,
-            },
-        )
+        record_claude(generation, response, MODEL, _jsonable(response.content))
         return response
 
 
 def _run_tool(
     langfuse: Any, block: Any, card: Card, state: GameState, by_id: dict, reads: dict
-) -> dict:
+) -> dict[str, Any]:
+    """Run one tool call and return what it found (or an "error" for Claude to act on)."""
     with langfuse.start_as_current_observation(
         name=block.name, as_type="tool", input=_jsonable(block.input)
     ) as span:
@@ -210,13 +314,8 @@ def _run_tool(
             output = _opponent_reads(state, reads)
         else:
             output = {"error": f"Unknown tool or hand: pick one of {sorted(by_id)}"}
-        span.update(output=output)
-    return {
-        "type": "tool_result",
-        "tool_use_id": block.id,
-        "content": json.dumps(output),
-        **({"is_error": True} if "error" in output else {}),
-    }
+        span.update(output=output, level="WARNING" if "error" in output else None)
+    return output
 
 
 def _odds(odds: HandOdds) -> dict[str, Any]:

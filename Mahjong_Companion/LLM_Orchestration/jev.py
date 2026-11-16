@@ -19,6 +19,8 @@ from typing import Any
 
 from mahjong_engine.tiles import FULL_SET, TileKind
 
+from mahjong_api.observability import prompt_version
+
 MODEL = "jev-1.13.0"  # pinned: thresholds below were set against this version
 INPUT_PRICE_PER_TOKEN = 0.042 / 1_000_000  # output tokens are free
 # Calibrated on 12 lines (Oct 30, jev-1.13.0): announcements scored 0.93, 0.75, 0.75, 0.60,
@@ -48,6 +50,26 @@ def _tile_criteria() -> dict[str, str]:
 
 
 TILE_CRITERIA = _tile_criteria()
+
+# What Jev is told and asked. ``{turn}`` is "your" or "Player 3's".
+SETTING = (
+    "One line of speech-to-text from an American Mahjong table. "
+    "It is {turn}'s turn. Number words are often misheard: 'for' = four, "
+    "'free' or 'tree' = three, 'ate' = eight, 'won' = one, 'to' = two."
+)
+GAME_TALK_QUESTION = {
+    "instructions": "Is this line a player naming the tile they are discarding now?",
+    "criteria": {
+        "true": "Announces a discard, e.g. 'three bam', 'I'll let go of the soap'.",
+        "false": "Conversation, a question, or a tile someone wants or holds.",
+    },
+}
+TILE_QUESTION = {
+    "instructions": "Which tile does the line name? Pick the closest even if unsure.",
+    "criteria": TILE_CRITERIA,
+}
+# Changes whenever the questions do; on every Jev generation, next to the pinned model.
+PROMPT_VERSION = prompt_version(SETTING, GAME_TALK_QUESTION, TILE_QUESTION)
 
 
 @dataclass(frozen=True)
@@ -81,24 +103,10 @@ def judge(client: Any, text: str, turn: str) -> Verdict:
     from typesafe_sdk import Choice, Noul
 
     response = client.system_one(
-        state={
-            "line": text,
-            "setting": "One line of speech-to-text from an American Mahjong table. "
-            f"It is {turn}'s turn. Number words are often misheard: 'for' = four, "
-            "'free' or 'tree' = three, 'ate' = eight, 'won' = one, 'to' = two.",
-        },
+        state={"line": text, "setting": SETTING.format(turn=turn)},
         questions={
-            "game_talk": Noul(
-                instructions="Is this line a player naming the tile they are discarding now?",
-                criteria={
-                    "true": "Announces a discard, e.g. 'three bam', 'I'll let go of the soap'.",
-                    "false": "Conversation, a question, or a tile someone wants or holds.",
-                },
-            ),
-            "tile": Choice(
-                instructions="Which tile does the line name? Pick the closest even if unsure.",
-                criteria=TILE_CRITERIA,
-            ),
+            "game_talk": Noul(**GAME_TALK_QUESTION),
+            "tile": Choice(**TILE_QUESTION),
         },
     )
     game_talk = _field(response.answers["game_talk"], "noul")

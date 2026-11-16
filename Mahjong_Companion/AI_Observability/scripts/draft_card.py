@@ -8,7 +8,9 @@
 
 The draft goes to data/private/cards/drafts/<year>.toml (gitignored: card data stays private).
 With --compare, every hand of a known card is checked against the draft by meaning, and the
-accuracy is printed and scored in Langfuse as card_draft_accuracy.
+accuracy is printed and scored in Langfuse as card_draft_accuracy. A run with --compare measures
+the drafter, so it is traced under the ``eval`` environment; a run without it drafts a card you
+will play with, so it counts as ``production``.
 
 This calls the Claude API: Claude Opus 5.5 at high effort costs roughly $0.25-1 per card,
 depending on how many correction rounds it needs. It refuses to run without --yes.
@@ -20,7 +22,7 @@ import argparse
 from pathlib import Path
 
 import anthropic
-from mahjong_api import card_draft
+from mahjong_api import card_draft, observability
 from mahjong_engine.card import load_card
 
 DRAFTS = Path(__file__).parents[1] / "data" / "private" / "cards" / "drafts"
@@ -39,6 +41,7 @@ def main() -> int:
         print(f"This calls {args.model} (roughly $0.25-1 per card). Add --yes to run.")
         return 1
 
+    observability.use_environment("eval" if args.compare else "production")
     panels = card_draft.card_panels(args.photo, args.panels)
     draft = card_draft.draft_card(anthropic.Anthropic(), panels, args.year, args.model)
     DRAFTS.mkdir(parents=True, exist_ok=True)

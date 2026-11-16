@@ -13,6 +13,7 @@ signs in; locally ``az login`` does.
 from __future__ import annotations
 
 import os
+from functools import cache
 from pathlib import Path
 from typing import Protocol
 
@@ -85,6 +86,11 @@ class BlobStore:
 
 
 def store_from_env() -> Store:
-    if url := os.environ.get("STORAGE_ACCOUNT_URL"):
-        return BlobStore(url)
-    return LocalStore(os.environ.get("DATA_DIR", "data/private"))
+    """The store the environment names. One per process, not one per request: a new blob client
+    signs in again and opens a new connection, which every tap would otherwise wait for."""
+    return _store(os.environ.get("STORAGE_ACCOUNT_URL"), os.environ.get("DATA_DIR", "data/private"))
+
+
+@cache
+def _store(account_url: str | None, data_dir: str) -> Store:
+    return BlobStore(account_url) if account_url else LocalStore(data_dir)

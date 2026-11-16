@@ -4,7 +4,8 @@
 
 Each file name says which tile it is (1bam.JPG, northwind.JPG, sprflower.JPG, ...), so every
 reading can be checked. Results go to Langfuse like the app's readings, with the
-``tile_cv_correct`` score, and a summary prints here.
+``tile_cv_correct`` and ``tile_fixes`` scores, and a summary prints here. They are traced under
+the ``eval`` environment, so they never mix with the photos read during real games.
 
 This calls the Claude API once per photo: 43 photos cost roughly $0.10-0.20. It refuses to run
 without --yes.
@@ -21,7 +22,7 @@ import re
 from pathlib import Path
 
 import anthropic
-from mahjong_api import vision
+from mahjong_api import observability, vision
 from PIL import Image
 
 TILES = Path(__file__).parents[1] / "Tiles"
@@ -60,6 +61,7 @@ def main() -> int:
         print(f"{len(photos)} photos in {TILES}. This calls Claude once per photo; add --yes.")
         return 1
 
+    observability.use_environment("eval")
     client = anthropic.Anthropic()
     right, wrong = 0, []
     for path in photos:

@@ -80,12 +80,15 @@ flowchart LR
     claude["Claude<br/>Sonnet 5.5 / Opus 5.5"]
     jev["Jev<br/>(TypeSafe)"]
     langfuse["Langfuse<br/>traces and scores"]
+    judge["Local judge<br/>open model on my desktop"]
 
     phone -- "taps, photos, heard lines" --> api
     phone -- "microphone audio out, text back" --> speech
     api -- "strategist, photo reading" ----> claude
     api -- "unclear table talk" ----> jev
     api -- "a trace per AI action,<br/>a score per player tap" ----> langfuse
+    langfuse -- "picks to grade" --> judge
+    judge -- "verdicts as scores" --> langfuse
 ```
 
 | Job | Done by |
@@ -147,8 +150,10 @@ sequenceDiagram
     Note over A: The hand ID must be one of the 5 candidates
     A-->>P: Go for this hand, because...
     A-)L: One trace with every model call and tool call
+    A-)L: Scores that need no judgment (rank of the pick, words in the reason, calls)
     P->>A: I'll go for it, or Not this one
     A-)L: Score recommendation_followed
+    Note over L: After the game, a local judge model grades the reason (Part 2)
 ```
 
 What makes it an orchestration problem rather than a prompt:
@@ -163,23 +168,34 @@ What makes it an orchestration problem rather than a prompt:
 The loop itself is short. Abridged from [`LLM_Orchestration/strategist.py`](LLM_Orchestration/strategist.py):
 
 ```python
-for _ in range(MAX_CALLS):  # 4
-    response = _call_claude(client, langfuse, messages)
+for round_number in range(1, MAX_CALLS + 1):  # 4
+    tally.llm_calls += 1
+    response = _call_claude(client, langfuse, messages, round_number)
     if response.stop_reason == "refusal":
+        tally.outcome = "refused"
         raise StrategistError("The model declined to answer")
     messages.append({"role": "assistant", "content": response.content})
     results = []
     for block in response.content:
         if block.type != "tool_use":
             continue
-        if block.name == "submit_pick" and block.input.get("hand_id") in by_id:
-            return pick  # only an engine candidate gets out
-        results.append(_run_tool(langfuse, block, card, state, by_id, reads or {}))
+        if block.name == "submit_pick":
+            if block.input.get("hand_id") in by_id:
+                tally.outcome = "picked"
+                return pick  # only an engine candidate gets out
+            tally.rejected_picks += 1  # an invented hand: counted, then sent back as an error
+        else:
+            tally.tool_calls += 1
+        output = _run_tool(langfuse, block, card, state, by_id, reads)
+        results.append({"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(output)})
     if not results:
         # Answered in text instead of calling the tool: ask once more.
+        tally.nudges += 1
         results = [{"type": "text", "text": "Call submit_pick with your choice."}]
     messages.append({"role": "user", "content": results})
 ```
+
+The `tally` is not just bookkeeping: when the ask ends, it becomes scores on the trace (how many calls, how many invented hands, how it ended), which is where [Part 2](#part-2-ai-observability) picks up.
 
 Each of those rules has a test that runs with a scripted model, so the suite needs no key and costs nothing: [`LLM_Orchestration/test_strategist.py`](LLM_Orchestration/test_strategist.py).
 
@@ -270,52 +286,245 @@ Not everything smart on the screen is a model. Calling advice and opponent reads
 
 ## Part 2: AI observability
 
-Everything the AI does is recorded in [Langfuse](https://langfuse.com), and built so that every feature has a quality number from real play rather than a feeling.
+Everything the AI does is recorded in [Langfuse](https://langfuse.com). The first version of this gave every feature a quality number from real play rather than a feeling. The second version, described here, is built to answer a harder question: **is the AI still as good, and as cheap, as it was last month?** A model behind a fixed name can change, prompts get edited, and the games themselves vary, so quality and token use can move without anyone deciding they should.
+
+```mermaid
+flowchart LR
+    app["App in Azure"]
+    langfuse[("Langfuse<br/>traces, scores,<br/>prompts, datasets")]
+    judge["Local judge<br/>open model on my desktop"]
+    drift["Drift report<br/>recent vs baseline"]
+    sets["Fixed test sets<br/>made-up positions"]
+    boards["Dashboards"]
+
+    app -- "traces, tap scores,<br/>code-check scores" --> langfuse
+    langfuse -- "picks to grade" --> judge
+    judge -- "four verdicts per pick" --> langfuse
+    langfuse -- "calls and scores" --> drift
+    sets -- "experiment runs" --> langfuse
+    langfuse --> boards
+```
+
+| Question | Answered by |
+| --- | --- |
+| What happened in this game, step by step? | [One trace per AI action](#one-trace-per-ai-action-one-session-per-game) and [the play-by-play](#the-game-as-a-play-by-play) |
+| Was each answer any good? | [Three kinds of score](#three-kinds-of-score), one of them from [a local judge model](#a-local-model-as-the-judge) |
+| Can I trust the judge? | [Judging the judge](#judging-the-judge) |
+| Has anything changed over time? | [Drift](#drift-has-anything-changed) |
+| Where do I look? | [Dashboards](#dashboards-and-a-langfuse-project-kept-in-code) |
 
 ### One trace per AI action, one session per game
 
 Each action is a trace, and all traces of one game share a session (the game's ID), so a game opens as a single timeline. This is what each trace looks like:
 
 ```
-strategist                agent        in: the 5 candidate hand IDs   out: hand ID + reason
-├─ claude                 generation   claude-sonnet-5-5, effort low, tokens in/out/cached
+strategist                agent        in: the situation and the engine's 5 candidates   out: hand ID, reason, engine rank
+├─ claude                 generation   claude-sonnet-5-5, effort low, tokens in/out/cached, why it stopped
 ├─ opponent_reads         tool
 ├─ claude                 generation
 ├─ hand_details           tool         in: {"hand_id": "1999-RUN-1"}
 └─ claude                 generation   answers with submit_pick
 
-heard                     chain        in: the line and whose turn    out: the proposed event
+heard                     chain        in: the line and whose turn    out: the proposed event, and what decided it
 ├─ parse-line             span         the grammar parser's reading and confidence
-└─ jev                    generation   only when the parser is unsure: jev-1.13.0, tokens, cost
+└─ jev                    generation   only when the parser is unsure: jev-1.13.0, tokens, cost, kept or dropped
 
 read-hand                 generation   claude-sonnet-5-5 vision; the photo itself is never logged
 
 draft-card                agent        session: the card's year       out: rounds used, hands found
-├─ claude-round-1         generation   claude-opus-5-5, effort high
+├─ claude                 generation   claude-opus-5-5, effort high, time to first token
 ├─ validate               tool         out: hands parsed and the list of problems
-├─ claude-round-2         generation
+├─ claude                 generation
 └─ validate               tool         out: no problems
 ```
+
+Every trace also carries the same six labels. They are set in one place, [`AI_Observability/observability.py`](AI_Observability/observability.py), so no feature can forget one:
+
+| Label | Values | Why it matters |
+| --- | --- | --- |
+| Environment | `production`, `development`, `eval`, `judge`, `selftest` | Real games never mix with test runs |
+| Release | The git commit of the deployed image | A change can be tied to a deploy |
+| Session | The game's ID | One game is one timeline |
+| Tag | `strategist`, `vision`, `table-talk`, `card-draft`, `play-by-play`, `judge` | Cost and quality per feature |
+| Prompt version | A fingerprint of the prompt text, linked to the prompt registered in Langfuse | A change can be tied to a prompt edit |
+| Player | A hash of the signed-in account | Per-player numbers, without the account ID leaving the app |
 
 A few choices worth pointing out:
 
 - **Token usage includes cache reads and writes**, so the saving from prompt caching shows up in cost, not just in theory.
+- **The model that actually answered is recorded.** Server-side fallback is on, so a refused request can be answered by another model. That generation is flagged and priced as the model that did the work.
 - **Jev has no Langfuse integration, so I traced it by hand.** Each call is recorded as a generation with the pinned model, its token usage and a cost computed from the published price, so it sits next to the Claude calls in the same cost view.
 - **Photos never go to Langfuse.** The trace records the prompt and the image size. The photo is kept in private storage with my corrected tiles, as training data for a future tile detector.
-- **Errors are first-class.** A refused photo, an unreadable answer, a Jev outage or a strategist run that hits its call limit marks the trace as an error, with the reason.
+- **Errors are first-class.** A refused photo, an unreadable answer, a Jev outage or a strategist run that hits its call limit marks the trace as an error, with the reason. An answer that comes back unusable still records the tokens it cost.
 
-### Every tap is a score
+### Three kinds of score
 
-The app never asks me to rate anything. The buttons I would press anyway are the feedback:
+The app never asks me to rate anything. Scores come from three places, and each answers a different question:
+
+| Kind | Examples | Answers |
+| --- | --- | --- |
+| My taps | `recommendation_followed`, `tile_fixes`, `discard_parse_correct`, `heard_outcome` | Was it useful to me? |
+| Checks in code | `pick_engine_rank`, `reason_within_limit`, `strategist_rejected_picks`, `discards_auto_logged` | Did it do what it was told? |
+| A local judge model | `judge_grounded`, `judge_matches_pick`, `judge_sound_choice`, `judge_clear` | Was the reason true and sensible? |
+
+**My taps.** The buttons I would press anyway are the feedback:
 
 | Score | Created when I... | Value | Answers the question |
 | --- | --- | --- | --- |
 | `recommendation_followed` | tap "I'll go for it" or "Not this one" | 1 or 0 | Do I actually trust the strategist's picks? |
-| `tile_cv_correct` | confirm my tiles after a photo | share of tiles it read right | How many fixes does a photo need? |
-| `discard_parse_correct` | confirm, fix or ignore a heard line (or leave an auto-logged one alone) | 1 or 0 | How often is a discard logged with no correction? |
+| `tile_cv_correct`, `tile_fixes` | confirm my tiles after a photo | share of tiles it read right, and how many I changed | How many fixes does a photo need? |
+| `discard_parse_correct`, `heard_outcome` | confirm, fix or ignore a heard line (or leave an auto-logged one alone) | 1 or 0, and which of the four I did | How often is a discard logged with no correction? |
 | `card_draft_accuracy` | run the card drafter against a known card | share of hands right | Can I trust a draft of next year's card? |
 
-One detail I like: a discard that was logged automatically is scored 1 straight away, but its score has a fixed ID. If I later press **Change** on it, the same score is overwritten with 0. So "auto-logged and never corrected" and "auto-logged, then fixed" are told apart without any extra bookkeeping.
+One detail I like: a discard that was logged automatically is scored 1 straight away, but its score has a fixed ID. If I later press **Change** on it, the same score is overwritten with 0. So "auto-logged and never corrected" and "auto-logged, then fixed" are told apart without any extra bookkeeping. Every score now works this way: one of each kind per trace, and scoring again overwrites.
+
+**Checks in code.** Some things can simply be counted, so they are, the moment an answer comes back:
+
+| Score | What it counts | Why I want it |
+| --- | --- | --- |
+| `pick_engine_rank` | Where the picked hand stood in the engine's closest-first list | Is the strategist adding judgment, or echoing the engine's top hand? |
+| `reason_within_limit`, `reason_words` | Whether the one sentence kept to the 25 words the prompt asks for | Is it following its instructions? |
+| `strategist_outcome` | How the ask ended: picked, refused, no pick, error | How often does it fail, and how? |
+| `strategist_rejected_picks` | Times it named a hand outside the candidates before settling | Is the guard against invented hands doing any work? |
+| `tiles_uncertain` | Tiles a photo reading flagged for me to check | Is it unsure about the tiles I end up fixing? |
+| `game_won`, `discards_auto_logged`, `game_fixed_moves` | Whole-game numbers, scored on the session | How much of a game logs itself? |
+
+Every score is declared once, with its type and meaning, and nothing can be written under a name that isn't on the list. From [`AI_Observability/observability.py`](AI_Observability/observability.py):
+
+```python
+ScoreDef(
+    "pick_engine_rank",
+    "NUMERIC",
+    "code",
+    "Where the picked hand stood in the engine's closest-first list (1 = the closest).",
+    min_value=1,
+    max_value=5,
+),
+```
+
+### A local model as the judge
+
+A tap tells me whether I followed a pick. It does not tell me whether the reason was true. "Go for this hand because you need only 2 tiles" sounds just as convincing when the engine said 4.
+
+So a second model grades the strategist. It is an open model (Gemma 4 12B in Google's own 4-bit build, about 8 GB) served by [Ollama](https://ollama.com) on my desktop. After a game night, [`scripts/judge.py`](AI_Observability/scripts/judge.py) reads the strategist's picks back from Langfuse, grades each one against what the strategist was shown, and writes the verdicts onto the pick's trace as scores. The judge is built and tested; its first run against the real model is the next step ([Where it stands](#where-it-stands)).
+
+| Check | Passes when |
+| --- | --- |
+| `grounded` | Every number and tile the reason states is true of the picked hand, my tiles or the table |
+| `matches_pick` | The reason argues for the hand that was picked, not another candidate |
+| `sound_choice` | The pick is the closest hand, or the reason names a real advantage that the engine's numbers confirm |
+| `clear` | One sentence, addressed to me, that names a hand and backs it with a tile or a number |
+
+The design choices, and why:
+
+- **A different model family from the one being judged.** Claude writes the pick and Gemma grades it, so the judge shares none of Claude's habits. It also costs nothing per call, and my game data goes nowhere new.
+- **A batch job on the desktop, not a service.** The Container App is half a CPU that scales to zero; it cannot hold a model. So judging happens after the game, and the scores arrive then.
+- **Pass or fail on one thing at a time.** Small models are steadier on four narrow yes/no questions than on one grade out of ten.
+- **Evidence before verdict.** The answer is a fixed JSON shape in which each check's `evidence` comes before its `pass`, so the verdict follows from what the judge found rather than the other way round.
+- **The counting is done for it.** Small models judge better than they count. The tiles I hold and which candidate is closest are worked out in code and handed over as facts.
+- **Every verdict is stamped** with the judge model and a fingerprint of the rubric, so a change in scores can be told apart from a change of judge.
+- **The judge is traced like any other model**: its tokens and its seconds per verdict have their own charts.
+
+This is the end of what the judge is shown for one answer (a made-up position on the sample card):
+
+```
+## Facts worked out for you
+The player's tiles, counted: 3x 3 bam, 1x 9 bam, 3x 3 crak, 1x 7 crak, 2x 3 dot, 1x 6 dot, 2x flower.
+The picked hand needs 4 tiles, the fewest of the 5 candidates.
+
+## The assistant's answer
+Picked hand: 1999-LIKE-1 ("Sample Like Numbers, top line")
+The picked hand's row from the engine: {"hand_id": "1999-LIKE-1", ..., "tiles_needed": 4, "outs": 12, ...}
+Reason given to the player: "Go for like numbers in 3s because you need only 2 tiles and have 20 outs with your 3 bams and 3 craks."
+
+Judge this answer.
+```
+
+A careful judge fails this on `grounded` (the engine says 4 tiles and 12 outs, not 2 and 20) and passes the other three: the reason is about the right hand, the hand is the closest, and the sentence is clear. It is just wrong. Code: [`AI_Observability/judge.py`](AI_Observability/judge.py).
+
+#### Judging the judge
+
+A judge I haven't measured is just a second opinion with a confident tone. So before its scores count, `judge.py calibrate` runs it on 18 answers that I labelled by hand: made-up positions on the sample card, six good answers and twelve broken on purpose.
+
+| The answer says | What is wrong with it | Should fail |
+| --- | --- | --- |
+| "...you need only 2 tiles and have 20 outs..." | The engine says 4 and 12 | `grounded` |
+| "...your pair of jokers and three 3 bams..." | There is no joker in the hand | `grounded` |
+| "...your joker can stand in for the 8 dot." | A joker can never be a single tile | `grounded` |
+| "...Player 2 has thrown three green dragons..." | The opponent read shows Player 2 has discarded nothing | `grounded` |
+| "Go for the evens hand..." when the pick was like numbers | It argues for a different hand | `matches_pick`, `grounded` |
+| A hand 10 tiles away "because you already hold three 3 bams" | True, but it names no advantage over the hand 4 away | `sound_choice` |
+| "This one is the best choice for you right now." | Nothing false, and nothing said | `clear` |
+
+Two of the good answers pick a hand that is *not* the closest and say why, with a reason the engine's numbers confirm. They are there to catch the opposite mistake: a judge that fails anything unusual.
+
+Each label is pinned to the engine's numbers it was written against, so if the engine ever changes them, a test fails instead of a label quietly going stale. The report gives agreement, Cohen's kappa (agreement beyond chance) and false passes for each check. Here is what it prints for a stand-in that passes everything, which is what an unmeasured judge might be:
+
+```
+Judge a-judge-that-passes-everything, rubric bf93c7e9: 18 answers x 1
+check           agreed   kappa  passed a fail  failed a pass
+grounded         10/18    0.00              8              0
+matches_pick     15/18    0.00              3              0
+sound_choice     12/15    0.00              3              0
+clear            15/18    0.00              3              0
+Overall agreement 75%, 18 s of judging.
+Where the judge and the labels differ:
+  threes-wrong-numbers / grounded: the judge passed it. Looks fine.
+  threes-invented-jokers / grounded: the judge passed it. Looks fine.
+  ...
+Not fit to judge at the 80% bar.
+```
+
+"75% agreement" sounds respectable until the kappa column says 0.00: no better than chance. That is why the report leads with kappa and false passes, not with the headline number.
+
+<sub>That report is real output from the calibration code, run with a scripted stand-in so the shape is visible. The judge itself is tested against a stand-in for Ollama's API; its first calibration on the real model, on my desktop, is the next step (see <a href="#where-it-stands">Where it stands</a>).</sub>
+
+### Drift: has anything changed?
+
+There are two ways to be fooled here, so there are two tools.
+
+**1. Compare two windows of time.** [`scripts/drift.py`](AI_Observability/scripts/drift.py) reads what the app recorded and compares the last two weeks with the two months before, feature by feature: tokens, cost and latency per call, cost per strategist ask, the share of heard lines that need Jev, and every score above.
+
+- A change is only called drift when it is **large** (15% for tokens, cost and latency; 10 points for a pass rate) **and unlikely to be chance**: a permutation test, corrected for the number of metrics tested at once, because with dozens of metrics something always looks significant.
+- A large move on too little data is reported as **watch**, not as a finding.
+- A metric with fewer than five values in either window says **not enough data** instead of guessing.
+- New models, prompt versions and releases are listed first, because they are the usual explanation.
+
+This is from the first report on my own traces. I have only played with listening on two days so far, October 30 and November 13, so I set the windows to put one on each side:
+
+```
+## What changed between the windows
+No new model, prompt version or release.
+
+## Drift
+| Feature | Metric | Baseline | Recent | Change | p | Verdict |
+| table talk | heard lines sent to Jev | 57% (n=144) | 13% (n=45) | -44 pts | <0.001 | better |
+| table talk | heard lines read right | 87% (n=70) | 98% (n=41) | +10 pts | 0.095 | watch |
+
+## Steady
+| table talk | cost per call | $0.000048 (n=82) | $0.000048 (n=6) | 0% | 0.191 | steady |
+| table talk | latency per call (median) | 0.14 s (n=82) | 0.13 s (n=6) | -5% | 0.694 | steady |
+| table talk | prompt tokens per call | 1,139 (n=82) | 1,135 (n=6) | 0% | 0.191 | steady |
+
+## Not enough data yet (fewer than 5 values in a window)
+- strategist: picks the player followed (1 in the baseline, 0 recent)
+- strategist: cost per ask (2 in the baseline, 0 recent)
+- ...
+```
+
+The report found a change I hadn't gone looking for: the share of heard lines that had to go to Jev fell from 57% to 13%. My best explanation is the parser work at the end of October, which taught it to hear an announcement inside a longer sentence. Lines read right also rose, from 87% to 98%, but on that much data it could still be luck, so it says "watch". And it is honest that I haven't asked the strategist often enough yet to say anything about it. Code: [`AI_Observability/drift.py`](AI_Observability/drift.py).
+
+**2. Hold the inputs still.** Real games change from night to night, so a dip could be the model or just a harder game. [`scripts/strategist_eval.py`](AI_Observability/scripts/strategist_eval.py) asks the strategist about nine made-up positions that never change, each built to test something:
+
+| Position | What it tests |
+| --- | --- |
+| Three sets of 3s already made | The easy case: one hand is far closer than the rest |
+| All four winds, two 5 bams already discarded | The closest hand is concealed, and its tiles are getting scarce |
+| An opponent exposed 3 dots with a joker, and I hold a 3 dot | A joker swap is on, and the closest hand has the fewest outs |
+| I called four north winds | Only one hand is left to choose |
+| Like numbers in 7s is closest, but the 7s keep getting discarded | Whether it reads the table, not just the distance |
+
+Each run is recorded as a Langfuse experiment on a dataset, and Langfuse lines the runs up side by side. When two runs differ, the system changed, not the games. A run costs about ten cents. The judge's 18 labelled answers are a dataset too, so the judge itself is re-measured after a model update. Code: [`AI_Observability/evalset.py`](AI_Observability/evalset.py) and [`AI_Observability/experiments.py`](AI_Observability/experiments.py).
 
 ### The game as a play-by-play
 
@@ -340,11 +549,37 @@ score  recommendation_followed = 1
 
 <sub>This is what the app recorded for the game in the screenshots above, condensed to a line each. I ran the real code locally with Langfuse swapped for a recorder and the model for the test suite's stand-in, so the names, nesting, sources and scores are the ones the deployed app sends.</sub>
 
-When someone declares Mahjong, a "Game over" summary is added (who won, how many moves, how many discards were tapped versus heard) and the trace buffer is flushed, because the app may scale to zero seconds later. Recording can never break a game: any Langfuse error is logged and swallowed. Code: [`AI_Observability/playbyplay.py`](AI_Observability/playbyplay.py).
+When someone declares Mahjong, a "Game over" summary is added (who won, how many moves, how many discards were tapped versus heard), the game is scored as a whole on its session, and the trace buffer is flushed, because the app may scale to zero seconds later. Recording can never break a game: any Langfuse error is logged and swallowed. Code: [`AI_Observability/playbyplay.py`](AI_Observability/playbyplay.py).
+
+### Dashboards, and a Langfuse project kept in code
+
+A Langfuse project collects settings that nobody remembers making. So mine are in code: [`scripts/langfuse_setup.py`](AI_Observability/scripts/langfuse_setup.py) creates whatever is missing and changes only what differs, and a second run changes nothing.
+
+- **A definition for every score**: its type, range and meaning, so Langfuse explains each score where it shows it.
+- **Every prompt, mirrored under a fingerprint.** The prompt text stays in the code, where the tests are. The script registers each version in Langfuse under a `sha-<fingerprint>` label, and the app links each call to it. Langfuse can then show cost, latency and scores per prompt version, and what any old fingerprint actually said.
+- **The two test sets** as datasets.
+- **Four dashboards:**
+
+| Board | What it shows |
+| --- | --- |
+| Mahjong Companion | One evening at a glance: games, moves, accuracy, cost |
+| Mahjong: AI quality | The judge's verdicts over time and by prompt version, picks followed, engine rank of the pick, how asks end, fixes per photo |
+| Mahjong: cost and tokens | Cost by feature, call and model, tokens and latency per call, prompt versions in use, failed and fallback calls |
+| Mahjong: judge and evals | Judge calibration over time, the fixed positions over time, the judge's own speed and tokens |
+
+The first three read real games only. The fourth reads test runs only. Before adding a widget, the script asks Langfuse the widget's question read-only, so a query that Langfuse would reject is caught before anything is created. Code: [`AI_Observability/langfuse_setup.py`](AI_Observability/langfuse_setup.py).
+
+### What reading my own traces turned up
+
+Building all this meant reading back what the app had actually been sending. Three things were wrong, and none of them would have shown up in a test:
+
+- **Every Claude call was being counted twice.** The Anthropic SDK emits its own OpenTelemetry span for each API call, and Langfuse stored it as a second generation with its own cost. My dashboard said $2.53 of AI cost. The real figure was $1.37. Those spans are no longer exported, and a test now runs the real Anthropic and Langfuse SDKs against a local stand-in server to prove it: with the filter each call arrives once, without it twice ([`tests/test_tracing_e2e.py`](AI_Observability/tests/test_tracing_e2e.py)).
+- **Two dashboard tiles had been showing nothing.** They filtered scores by session, which Langfuse only matches for scores on a whole game, never for scores on a trace.
+- **The strategist ignores its word limit.** The prompt asks for one sentence of at most 25 words. The two reasons from real games ran to 28 and 31. Nobody would have noticed; `reason_within_limit` now counts it.
 
 ### Measuring before shipping
 
-The same scores are used offline. [`AI_Observability/vision_eval.py`](AI_Observability/vision_eval.py) runs the photo reader over my labelled tile photos, and [`AI_Observability/draft_card.py`](AI_Observability/draft_card.py) scores a card draft against a card I have checked. Both write to Langfuse exactly as the live app does, so an experiment and real play can be compared in one place. Both also refuse to run without `--yes`, because they spend money.
+The same scores are used offline. [`scripts/vision_eval.py`](AI_Observability/scripts/vision_eval.py) runs the photo reader over my labelled tile photos, and [`scripts/draft_card.py`](AI_Observability/scripts/draft_card.py) scores a card draft against a card I have checked. Both write to Langfuse exactly as the live app does, but under the `eval` environment, so an experiment and real play can be compared without being mixed. Both also refuse to run without `--yes`, because they spend money.
 
 | Decision | What the numbers said |
 | --- | --- |
@@ -353,6 +588,8 @@ The same scores are used offline. [`AI_Observability/vision_eval.py`](AI_Observa
 | Whether Opus can be trusted to draft a card | 54 of 55 hands on the 2024 card in one round. Still reviewed by me. |
 
 Each feature also has an exit check tied to its score: I follow the strategist's pick most of the time, a hand photo needs at most one fix on average, and most discards are logged with no fix.
+
+And the wiring itself has a check. [`scripts/langfuse_smoke.py`](AI_Observability/scripts/langfuse_smoke.py) sends one made-up action per feature through the real code into Langfuse, under an environment of its own that no dashboard reads, then reads the traces back and checks eleven things: the right session and environment, tagged, versioned, linked to their prompt, priced once, scored.
 
 ---
 
@@ -422,7 +659,7 @@ flowchart LR
     login --> update["Point the Container App<br/>at the new image"]
 ```
 
-Every change goes through a pull request (28 so far), and CI runs the Python linter and formatter, the test suite (186 tests today), the web build and a Bicep build. A merge to `main` deploys on its own, one deploy at a time: a concurrency group queues them, because Azure rejects an update while another is in progress. Changes to the infrastructure itself are deployed by hand. Files: [`ci.yml`](Cloud_Infrastructure/ci.yml), [`deploy.yml`](Cloud_Infrastructure/deploy.yml), [`Dockerfile`](Cloud_Infrastructure/Dockerfile).
+Every change goes through a pull request (30 so far), and CI runs the Python linter and formatter, the test suite (313 tests today), the web build and a Bicep build. A merge to `main` deploys on its own, one deploy at a time: a concurrency group queues them, because Azure rejects an update while another is in progress. Changes to the infrastructure itself are deployed by hand. The deploy also stamps the image with its git commit and the word "production", which Langfuse records on every trace as the release and the environment. Files: [`ci.yml`](Cloud_Infrastructure/ci.yml), [`deploy.yml`](Cloud_Infrastructure/deploy.yml), [`Dockerfile`](Cloud_Infrastructure/Dockerfile).
 
 ### What it costs
 
@@ -442,15 +679,16 @@ Idle cost is well under a dollar a month, and the AI calls come to cents per gam
 | Path | What it is |
 | --- | --- |
 | [`LLM_Orchestration/`](LLM_Orchestration/) | The strategist agent and its tests, photo reading, card drafting, the table-talk pipeline and the Jev client. |
-| [`AI_Observability/`](AI_Observability/) | The play-by-play recorder, the API routes that turn taps into scores, and the two offline evals. |
+| [`AI_Observability/`](AI_Observability/) | The tracing module, the local judge and its labelled test answers, the drift report, the fixed test sets, the Langfuse setup kept in code, the play-by-play recorder, and the scripts and tests that go with them. |
 | [`Cloud_Infrastructure/`](Cloud_Infrastructure/) | The Bicep file, Dockerfile, CI and deploy workflows, blob storage access and the speech token endpoint. |
-| [`Design_Decisions/`](Design_Decisions/) | The six short decision records behind the design. |
+| [`Design_Decisions/`](Design_Decisions/) | The seven short decision records behind the design. |
 | [`Images/`](Images/) | Screenshots of the app running on the made-up sample card. |
 
 The source files are copies from the private repository. Each is marked at the top with where it came from, and they are otherwise unchanged except for one example line in the card-drafting prompt, which was swapped for a made-up one.
 
 ## What is not here, and why
 
+- **No Langfuse project.** The dashboards, traces and scores live in my private Langfuse project. What is here is the code that builds and reads them.
 - **No keys, tokens or connection strings.** The code only ever reads them from environment variables, and the real values live in Azure Key Vault. Nothing in this folder can call my Anthropic, Langfuse, TypeSafe or Azure accounts.
 - **No way in to the running app.** Its address is not published, and it sits behind a Microsoft sign-in that admits a single account.
 - **No working pipeline.** The two workflow files sit outside `.github/workflows`, so GitHub never runs them here. The real deploy trusts only the private repository.
@@ -467,10 +705,13 @@ Each of these is a short record in [`Design_Decisions/`](Design_Decisions/).
 4. [Jev for the game-talk filter, Claude for the hand pick](Design_Decisions/0004-jev-for-typed-decisions.md)
 5. [Cards are TOML files in a notation that mirrors the printed card](Design_Decisions/0005-card-format.md)
 6. [One container behind Microsoft sign-in, image in GitHub's registry](Design_Decisions/0006-one-container-behind-sign-in.md)
+7. [Measure every AI step the same way, and judge it with a local model](Design_Decisions/0007-measure-the-ai-and-judge-it-locally.md)
 
 ## Where it stands
 
-The engine, the tap-only app, the strategist, photo reading, card drafting and live listening are all built and deployed, and I have played full games with it. Two things are next:
+The engine, the tap-only app, the strategist, photo reading, card drafting and live listening are all built and deployed, and I have played full games with it. The observability layer in Part 2 is built too, and its Langfuse side (score definitions, prompts, datasets, dashboards) is live. What is next:
 
+- **Calibrate the judge on my desktop.** The judge is written and tested against a stand-in for Ollama, but it has not graded anything with the real model yet. Its first calibration run decides whether Gemma 4 12B is fit to judge, or whether the rubric or my labels need work first.
+- **A first run of the fixed positions**, to set the baseline that every later run is compared with.
 - **A trained tile detector.** Claude's vision is the baseline. Every rack photo is saved with the tiles I confirmed, so the training set is building itself, and the `tile_cv_correct` score is the bar a detector has to beat.
-- **Polish**, guided by the three scores from real games.
+- **Polish**, guided by the scores from real games.

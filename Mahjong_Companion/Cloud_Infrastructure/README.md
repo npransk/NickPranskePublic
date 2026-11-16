@@ -5,7 +5,7 @@ The source behind [Part 3 of the write-up](../README.md#part-3-cloud-infrastruct
 | File | What it does | Worth a look |
 | --- | --- | --- |
 | [`main.bicep`](main.bicep) | Every Azure resource, in one file: Container App, managed identity, Key Vault, storage, Speech, logging, sign-in and a budget. | The `secrets` block: each app secret is a Key Vault reference read by the managed identity. The `auth` resource: sign-in in front of everything, one user allowed. `scale`: zero to one replica. |
-| [`Dockerfile`](Dockerfile) | Builds one image in two stages: Node builds the web page, then a slim Python image serves the API and that page. | One image means one address and one sign-in for both. |
+| [`Dockerfile`](Dockerfile) | Builds one image in two stages: Node builds the web page, then a slim Python image serves the API and that page. | One image means one address and one sign-in for both. The last lines stamp the image with its git commit and environment, which Langfuse records on every trace. |
 | [`ci.yml`](ci.yml) | Runs on every pull request: lint, format check, tests, web build, Bicep build. | |
 | [`deploy.yml`](deploy.yml) | Runs on every merge to `main`: build, push to GitHub's registry, sign in to Azure with OIDC, update the Container App. | `id-token: write` and `vars.*` instead of `secrets.*`: no Azure secret is stored in GitHub. The `concurrency` group runs one deploy at a time. |
 | [`store.py`](store.py) | Where games, cards and photos are kept: a local folder on my laptop, blob storage in Azure. | `BlobStore` signs in with `DefaultAzureCredential`, so there is no connection string anywhere. |

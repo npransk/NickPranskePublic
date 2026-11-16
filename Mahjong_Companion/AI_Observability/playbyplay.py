@@ -8,6 +8,10 @@ card, or the call advice) and the player's position after it (top hand, tiles aw
 advice). Fixes and undos are entries of their own, and Mahjong adds a game summary. The session
 view then reads as a replay, with heard lines, strategist asks and photo readings in between.
 
+A finished game is also scored as a whole, on its session: whether you won, how many moves it
+took, what share of the discards were logged from a heard line without a tap, and how many moves
+had to be changed afterwards.
+
 Recording must never break the game: any Langfuse error is swallowed.
 """
 
@@ -17,9 +21,7 @@ import logging
 from collections import Counter
 from typing import Any
 
-from langfuse import propagate_attributes
-
-from mahjong_api.strategist import langfuse_client
+from mahjong_api.observability import langfuse_client, record_score, trace
 
 log = logging.getLogger(__name__)
 # Keys the app adds to an event to say where it came from; the game rules ignore them.
@@ -27,6 +29,8 @@ SOURCE_KEYS = ("source", "heard", "heard_trace")
 
 
 def describe(event: dict[str, Any]) -> str:
+    """A move in words. Dashboard tiles count moves by these words (" discards ", "Game over",
+    "Changed move"), so the wording is part of what Langfuse is told: change both together."""
     who = "You" if event.get("player") == 1 else f"Player {event.get('player')}"
     match event.get("type"):
         case "deal":
@@ -86,6 +90,7 @@ def record_summary(game_id: str, view: dict[str, Any]) -> None:
     events = view.get("events", [])
     sources = Counter(e.get("source", "tap") for e in events if e.get("type") == "discard")
     winner = view.get("winner")
+    _score_game(game_id, winner, events, sources)
     _record(
         game_id,
         f"Game over: {'you won' if winner == 1 else f'Player {winner} won'}",
@@ -103,6 +108,27 @@ def record_summary(game_id: str, view: dict[str, Any]) -> None:
         langfuse_client().flush()  # the app may scale to zero soon after a game ends
     except Exception:
         log.warning("Langfuse flush failed", exc_info=True)
+
+
+def _score_game(
+    game_id: str, winner: int | None, events: list[dict[str, Any]], sources: Counter[str]
+) -> None:
+    """Scores on the whole game (the Langfuse session). Declaring Mahjong again after an undo
+    overwrites them."""
+    discards = sources.total()
+    scores: dict[str, float | bool] = {
+        "game_won": winner == 1,
+        "game_moves": len(events),
+        "game_fixed_moves": sum(1 for e in events if e.get("source") == "fix"),
+    }
+    if discards:
+        scores["discards_auto_logged"] = sources["auto"] / discards
+    try:
+        langfuse = langfuse_client()
+        for name, value in scores.items():
+            record_score(langfuse, name, value, session_id=game_id, score_id=f"{game_id}-{name}")
+    except Exception:
+        log.warning("Couldn't score a game in Langfuse", exc_info=True)
 
 
 def _position(view: dict[str, Any]) -> dict[str, Any]:
@@ -126,7 +152,7 @@ def _source(event: dict[str, Any]) -> dict[str, Any]:
 def _record(game_id: str, name: str, **fields: Any) -> None:
     try:
         langfuse = langfuse_client()
-        with propagate_attributes(session_id=game_id, trace_name=name, tags=["play-by-play"]):
+        with trace(name, game_id=game_id, feature="play-by-play"):
             langfuse.create_event(name=name, **fields)
     except Exception:
         log.warning("Couldn't record a move in Langfuse", exc_info=True)

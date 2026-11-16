@@ -4,8 +4,8 @@
 
 Claude answers in a fixed JSON shape whose tile names are limited to the 36 the engine knows, so
 the reading drops straight into the tile picker. Tiles it isn't sure of are flagged for the
-player to check; every fix the player makes becomes the ``tile_cv_correct`` score in Langfuse,
-which is the baseline a trained detector will be measured against later.
+player to check; every fix the player makes becomes the ``tile_cv_correct`` and ``tile_fixes``
+scores in Langfuse, which are the baseline a trained detector will be measured against later.
 """
 
 from __future__ import annotations
@@ -15,13 +15,23 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
-from langfuse import propagate_attributes
 from mahjong_engine.tiles import FULL_SET
 
-from mahjong_api.strategist import langfuse_client
+from mahjong_api.observability import (
+    flush,
+    langfuse_client,
+    marking_errors,
+    prompt_link,
+    prompt_version,
+    record_claude,
+    record_score,
+    trace,
+)
 
 MODEL = "claude-sonnet-5-5"
 EFFORT = "low"
+MAX_TOKENS = 4096
+PROMPT_NAME = "read-hand"
 MEDIA_TYPES = {"image/jpeg", "image/png", "image/webp"}
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 TILE_NAMES = [str(t) for t in sorted(FULL_SET)]
@@ -67,6 +77,10 @@ SCHEMA = {
 }
 
 
+# Changes whenever the instructions or the answer shape do; on every photo-reading trace.
+PROMPT_VERSION = prompt_version(PROMPT, SCHEMA)
+
+
 class VisionError(RuntimeError):
     """The photo couldn't be read."""
 
@@ -89,19 +103,31 @@ def read_hand(client: Any, image_b64: str, media_type: str, game_id: str) -> Rea
         "type": "image",
         "source": {"type": "base64", "media_type": media_type, "data": image_b64},
     }
-    with propagate_attributes(session_id=game_id, trace_name="read-hand"):
-        with langfuse.start_as_current_observation(
-            name="read-hand",
-            as_type="generation",
-            model=MODEL,
-            model_parameters={"effort": EFFORT},
-            # The photo itself is left out of the trace; its size is enough to compare runs.
-            input={"prompt": PROMPT, "image_bytes": len(image_b64) * 3 // 4},
-        ) as generation:
+    image_bytes = len(image_b64) * 3 // 4
+    try:
+        with (
+            trace(
+                "read-hand",
+                game_id=game_id,
+                feature="vision",
+                version=PROMPT_VERSION,
+                prompt=prompt_link(PROMPT_NAME, PROMPT_VERSION),
+                image_bytes=image_bytes,
+            ),
+            langfuse.start_as_current_observation(
+                name="read-hand",
+                as_type="generation",
+                model=MODEL,
+                model_parameters={"effort": EFFORT, "max_tokens": MAX_TOKENS},
+                # The photo itself is left out of the trace; its size is enough to compare runs.
+                input={"prompt": PROMPT, "image_bytes": image_bytes, "media_type": media_type},
+            ) as generation,
+            marking_errors(generation),
+        ):
             trace_id = langfuse.get_current_trace_id()
             response = client.beta.messages.create(
                 model=MODEL,
-                max_tokens=4096,
+                max_tokens=MAX_TOKENS,
                 messages=[{"role": "user", "content": [image, {"type": "text", "text": PROMPT}]}],
                 output_config={
                     "effort": EFFORT,
@@ -110,28 +136,22 @@ def read_hand(client: Any, image_b64: str, media_type: str, game_id: str) -> Rea
                 betas=["server-side-fallback-2026-07-01"],
                 fallbacks="default",
             )
-            if response.stop_reason == "refusal":
-                generation.update(level="ERROR", status_message="declined")
-                raise VisionError("The model declined to read the photo")
             text = next((b.text for b in response.content if b.type == "text"), "")
+            # Record the call before judging its answer: a reading that fails still cost tokens.
+            record_claude(generation, response, MODEL, text)
+            if response.stop_reason == "refusal":
+                raise VisionError("The model declined to read the photo")
             try:
                 found = json.loads(text)["tiles"]
             except (ValueError, KeyError) as e:
-                generation.update(level="ERROR", status_message=f"Unreadable answer: {e}")
                 raise VisionError("The model's answer couldn't be read") from e
-            usage = response.usage
-            generation.update(
-                output=found,
-                usage_details={
-                    "input": usage.input_tokens,
-                    "output": usage.output_tokens,
-                    "cache_read_input_tokens": usage.cache_read_input_tokens or 0,
-                    "cache_creation_input_tokens": usage.cache_creation_input_tokens or 0,
-                },
-            )
-    langfuse.flush()
-    tiles = [t["tile"] for t in found]
-    uncertain = [i for i, t in enumerate(found) if t["uncertain"]]
+            generation.update(output=found)
+        tiles = [t["tile"] for t in found]
+        uncertain = [i for i, t in enumerate(found) if t["uncertain"]]
+        for name, value in (("tiles_read", len(tiles)), ("tiles_uncertain", len(uncertain))):
+            record_score(langfuse, name, value, trace_id=trace_id, score_id=f"{trace_id}-{name}")
+    finally:
+        flush()
     return Reading(tiles, uncertain, trace_id)
 
 
@@ -142,16 +162,20 @@ def fixes_needed(read: list[str], final: list[str]) -> int:
 
 
 def score_reading(trace_id: str, read: list[str], final: list[str]) -> float:
-    """Record how good a reading was: the share of the final tiles it got right."""
+    """Record how good a reading was: the share of the final tiles it got right, and how many
+    tiles the player had to fix. One of each per reading; a second answer overwrites."""
     fixes = fixes_needed(read, final)
     correct = max(0.0, 1 - fixes / max(len(final), 1))
     langfuse = langfuse_client()
-    langfuse.create_score(
-        name="tile_cv_correct",
-        value=correct,
-        data_type="NUMERIC",
-        trace_id=trace_id,
-        comment=f"{fixes} fix{'es' if fixes != 1 else ''} to {len(final)} tiles",
-    )
-    langfuse.flush()
+    comment = f"{fixes} fix{'es' if fixes != 1 else ''} to {len(final)} tiles"
+    for name, value in (("tile_cv_correct", correct), ("tile_fixes", fixes)):
+        record_score(
+            langfuse,
+            name,
+            value,
+            trace_id=trace_id,
+            score_id=f"{trace_id}-{name}",
+            comment=comment,
+        )
+    flush()
     return correct

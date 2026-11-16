@@ -43,6 +43,10 @@ jobs:
           file: services/api/Dockerfile
           push: true
           tags: ${{ env.IMAGE }}:${{ github.sha }}
+          # Recorded on every Langfuse trace as the release and the environment.
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            TRACING_ENVIRONMENT=production
 
       # OIDC sign-in: no Azure secret is stored in GitHub. IDs are repo variables, not secrets.
       - uses: azure/login@v2

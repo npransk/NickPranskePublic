@@ -20,18 +20,29 @@ import io
 import re
 import tomllib
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from langfuse import propagate_attributes
 from mahjong_engine import card as card_format
 from mahjong_engine.card import Card, CardError, Hand, card_from_dict, validate_card
 
-from mahjong_api.strategist import langfuse_client
+from mahjong_api.observability import (
+    flush,
+    langfuse_client,
+    marking_errors,
+    prompt_link,
+    prompt_version,
+    record_claude,
+    record_score,
+    trace,
+)
 
 MODEL = "claude-opus-5-5"  # once a year and accuracy matters: the most capable Opus
 EFFORT = "high"
 MAX_ROUNDS = 4
+MAX_TOKENS = 32000
+PROMPT_NAME = "draft-card"
 LONG_EDGE = 1568
 SAMPLE_CARD = Path(__file__).parents[4] / "packages" / "engine" / "tests" / "sample_card.toml"
 
@@ -64,6 +75,9 @@ A made-up example of the format (not from any real card):
 
 ```toml
 {SAMPLE_CARD.read_text(encoding="utf-8")}```"""
+
+# Changes whenever the instructions (or the card format they quote) do; on every draft trace.
+PROMPT_VERSION = prompt_version(SYSTEM)
 
 
 class DraftError(RuntimeError):
@@ -176,10 +190,22 @@ def draft_card(client: Any, panels: list[str], year: int, model: str = MODEL) ->
     content.append({"type": "text", "text": f"Transcribe the {year} card. Set year = {year}."})
     messages: list[dict[str, Any]] = [{"role": "user", "content": content}]
 
-    with propagate_attributes(session_id=f"card-{year}", trace_name="draft-card"):
-        with langfuse.start_as_current_observation(
-            name="draft-card", as_type="agent", input={"year": year, "panels": len(panels)}
-        ) as agent:
+    try:
+        with (
+            trace(
+                "draft-card",
+                game_id=f"card-{year}",
+                feature="card-draft",
+                version=PROMPT_VERSION,
+                prompt=prompt_link(PROMPT_NAME, PROMPT_VERSION),
+                year=year,
+                panels=len(panels),
+            ),
+            langfuse.start_as_current_observation(
+                name="draft-card", as_type="agent", input={"year": year, "panels": len(panels)}
+            ) as agent,
+            marking_errors(agent),
+        ):
             trace_id = langfuse.get_current_trace_id()
             toml_text, card, problems = "", None, ["No draft yet"]
             for round_number in range(1, MAX_ROUNDS + 1):
@@ -191,7 +217,8 @@ def draft_card(client: Any, panels: list[str], year: int, model: str = MODEL) ->
                     name="validate", as_type="tool", input={"round": round_number}
                 ) as span:
                     span.update(
-                        output={"hands": len(card.hands) if card else 0, "problems": problems}
+                        output={"hands": len(card.hands) if card else 0, "problems": problems},
+                        level="WARNING" if problems else None,
                     )
                 if not problems:
                     break
@@ -205,47 +232,65 @@ def draft_card(client: Any, panels: list[str], year: int, model: str = MODEL) ->
                     }
                 )
             agent.update(
-                output={"rounds": round_number, "hands": len(card.hands) if card else 0},
+                output={
+                    "rounds": round_number,
+                    "hands": len(card.hands) if card else 0,
+                    "problems_left": len(problems),
+                },
                 level="DEFAULT" if not problems else "WARNING",
+                status_message=None if not problems else f"{len(problems)} problems left",
             )
-    langfuse.flush()
+        for name, value in (
+            ("card_draft_rounds", round_number),
+            ("card_draft_clean", not problems),
+        ):
+            record_score(langfuse, name, value, trace_id=trace_id, score_id=f"{trace_id}-{name}")
+    finally:
+        flush()
     if card is None and not toml_text.strip():
         raise DraftError("No card came back")
     return Draft(toml_text, card, problems, round_number, trace_id)
 
 
 def _call(client: Any, langfuse: Any, model: str, messages: list, round_number: int) -> Any:
-    with langfuse.start_as_current_observation(
-        name=f"claude-round-{round_number}",
-        as_type="generation",
-        model=model,
-        model_parameters={"effort": EFFORT},
-        input={"round": round_number, "messages": len(messages)},
-    ) as generation:
+    with (
+        langfuse.start_as_current_observation(
+            name="claude",
+            as_type="generation",
+            model=model,
+            model_parameters={"effort": EFFORT, "max_tokens": MAX_TOKENS},
+            # The photos and the drafted card stay out of the trace (ADR 2): sizes only.
+            input={"round": round_number, "messages": len(messages)},
+            metadata={"round": round_number},
+        ) as generation,
+        marking_errors(generation),
+    ):
         # A whole card is a long answer: stream it so the request can't time out.
+        first_text_at = None
         with client.beta.messages.stream(
             model=model,
-            max_tokens=32000,
+            max_tokens=MAX_TOKENS,
             system=SYSTEM,
             messages=messages,
             output_config={"effort": EFFORT},
             betas=["server-side-fallback-2026-07-01"],
             fallbacks="default",
         ) as stream:
+            for event in stream:
+                if first_text_at is None and event.type == "content_block_delta":
+                    first_text_at = datetime.now(UTC)  # Langfuse shows it as time to first token
             response = stream.get_final_message()
-        if response.stop_reason == "refusal":
-            generation.update(level="ERROR", status_message="declined")
-            raise DraftError("The model declined to transcribe the card")
-        usage = response.usage
-        generation.update(
-            output={"stop_reason": response.stop_reason},
-            usage_details={
-                "input": usage.input_tokens,
-                "output": usage.output_tokens,
-                "cache_read_input_tokens": usage.cache_read_input_tokens or 0,
-                "cache_creation_input_tokens": usage.cache_creation_input_tokens or 0,
-            },
+        text = next((b.text for b in response.content if b.type == "text"), "")
+        record_claude(
+            generation,
+            response,
+            model,
+            {"stop_reason": response.stop_reason, "characters": len(text)},
         )
+        if first_text_at is not None:
+            generation.update(completion_start_time=first_text_at)
+        if response.stop_reason == "refusal":
+            raise DraftError("The model declined to transcribe the card")
         return response
 
 
@@ -269,11 +314,12 @@ def _meaning(hand: Hand) -> tuple:
 def score(trace_id: str, comparison: Comparison) -> None:
     langfuse = langfuse_client()
     total = len(comparison.matched) + len(comparison.missed)
-    langfuse.create_score(
-        name="card_draft_accuracy",
-        value=comparison.accuracy,
-        data_type="NUMERIC",
+    record_score(
+        langfuse,
+        "card_draft_accuracy",
+        comparison.accuracy,
         trace_id=trace_id,
+        score_id=f"{trace_id}-card_draft_accuracy",
         comment=f"{len(comparison.matched)} of {total} hands",
     )
-    langfuse.flush()
+    flush()

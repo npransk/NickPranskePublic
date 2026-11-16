@@ -4,12 +4,12 @@ The source behind [Part 1 of the write-up](../README.md#part-1-llm-orchestration
 
 | File | What it does | Worth a look |
 | --- | --- | --- |
-| [`strategist.py`](strategist.py) | The agent that picks which hand to go for. Claude Sonnet 5.5 at low effort, three strict tools, at most 4 model calls. | `ask()` is the whole loop. `TOOLS` and `SYSTEM` are the contract with the model. |
-| [`test_strategist.py`](test_strategist.py) | Tests for the loop with a scripted stand-in for Claude: no key, no network, no cost. | A made-up hand is rejected, a text answer is nudged toward the tool, the loop gives up after the call limit, a refusal is an error. |
+| [`strategist.py`](strategist.py) | The agent that picks which hand to go for. Claude Sonnet 5.5 at low effort, three strict tools, at most 4 model calls. | `_decide()` is the whole loop. `ask()` wraps it in a trace and scores the result. `TOOLS` and `SYSTEM` are the contract with the model. |
+| [`test_strategist.py`](test_strategist.py) | Tests for the loop with a scripted stand-in for Claude: no key, no network, no cost. | A made-up hand is rejected, a text answer is nudged toward the tool, the loop gives up after the call limit, a refusal is an error. Each ask is traced with everything it was based on, and scored by checks that need no judgment. |
 | [`vision.py`](vision.py) | Reads a photo of a rack into tile names. One call with a JSON schema that only allows the engine's 36 tile names. | `PROMPT` describes the markings of the actual tile set, which is what took accuracy from 40 to 42 of 43 photos. |
 | [`card_draft.py`](card_draft.py) | Drafts a year's card from a photo. Claude Opus 5.5 at high effort writes it, the engine's validator checks it, problems go back for up to 4 rounds. | `draft_card()` is the repair loop. `compare()` scores a draft by meaning, not spelling. |
 | [`sample_card.toml`](sample_card.toml) | A made-up card in the engine's format. It is the example the drafter is shown, and the card behind every screenshot. | Not from any real card. |
-| [`listen.py`](listen.py) | Turns one heard line into a proposed game event: grammar parser first, Jev only when the parser is unsure, the player decided by turn order. | `hear()` and `_ask_jev()`. `score()` writes the player's answer back as a Langfuse score. |
+| [`listen.py`](listen.py) | Turns one heard line into a proposed game event: grammar parser first, Jev only when the parser is unsure, the player decided by turn order. | `hear()` and `_ask_jev()`. `score()` writes the player's answer back as two Langfuse scores. |
 | [`jev.py`](jev.py) | The client for Jev (TypeSafe): two typed questions per line, a yes/no and a choice over 36 tiles, with a measured cut-off. | The comment above `GAME_TALK` is the calibration data. |
 
 ## Which model does which job

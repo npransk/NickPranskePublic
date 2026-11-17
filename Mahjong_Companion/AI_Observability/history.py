@@ -1,6 +1,6 @@
 # Showcase copy of services/api/src/mahjong_api/history.py from the private mahjong-companion repo. Here to be read, not run.
 
-"""Read back what the app sent to Langfuse, for the judge and the drift report.
+"""Read back what the app sent to Langfuse, for the drift report.
 
 Langfuse's v2 observations and v3 scores endpoints are the ones that still exist for projects
 created after September 2026; both page with a cursor. Inputs and outputs come back as JSON
@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterator
 from datetime import datetime
 from typing import Any
 
-# Everything the judge and the drift report read from an observation.
+# Everything the drift report reads from an observation.
 FIELDS = "core,basic,io,metadata,model,usage,metrics,trace_context,prompt"
 PAGE = 200
 SCORE_PAGE = 100  # the most the scores endpoint allows

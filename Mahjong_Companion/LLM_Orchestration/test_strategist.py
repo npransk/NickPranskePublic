@@ -2,6 +2,7 @@
 
 """Strategist tests with a scripted stand-in for Claude: no API key, no network, no cost."""
 
+import json
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -125,7 +126,7 @@ def test_an_ask_is_traced_with_everything_it_was_based_on(card, state, langfuse)
     pick = strategist.ask(claude, card, state, "game-1")
     assert pick.trace_id == langfuse.trace_id
     (agent,) = langfuse.named("strategist")
-    # The situation and the engine's numbers are on the trace, so a judge needs nothing else.
+    # The situation and the engine's numbers are on the trace, so a review needs nothing else.
     assert "Your tiles (13)" in agent["input"]["situation"]
     assert agent["input"]["candidates"][0]["hand_id"] == "1999-LIKE-1"
     assert agent["output"] == {
@@ -249,6 +250,25 @@ def test_route_returns_the_pick(client):
     pick = client.post(f"/api/games/{game_id}/strategist").json()
     assert pick["hand_id"] == "1999-LIKE-1"
     assert pick["reason"] == "Closest."
+    assert pick["ask"] == 1  # kept with the game for the game review
+    kept = client.app.dependency_overrides[games.get_store]().get(f"games/{game_id}.ai.json")
+    (ask,) = json.loads(kept)["asks"]
+    assert (ask["move"], ask["hand_id"], ask["followed"]) == (1, "1999-LIKE-1", None)
+
+
+def test_feedback_without_tracing_is_still_kept_with_the_game(client, langfuse):
+    game_id = started_game(client)
+    claude = FakeClaude(tool_call("submit_pick", hand_id="1999-LIKE-1", reason="Closest."))
+    app.dependency_overrides[games.get_claude] = lambda: claude
+    client.post(f"/api/games/{game_id}/strategist")
+    langfuse.scores.clear()
+    body = {"hand_id": "1999-LIKE-1", "followed": False, "ask": 1}
+    assert client.post(f"/api/games/{game_id}/strategist/feedback", json=body).json() == {
+        "recorded": True
+    }
+    assert langfuse.scores == []  # no trace to score
+    kept = client.app.dependency_overrides[games.get_store]().get(f"games/{game_id}.ai.json")
+    assert json.loads(kept)["asks"][0]["followed"] is False
 
 
 def test_route_without_an_api_key_is_unavailable(client):

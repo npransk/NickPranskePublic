@@ -5,7 +5,8 @@
 Each move becomes one Langfuse event in the game's session, named like the move ("Player 3
 discards 9 bam"), with where it came from (tapped, auto-logged from a heard line, confirmed from a
 card, or the call advice) and the player's position after it (top hand, tiles away, any call
-advice). Fixes and undos are entries of their own, and Mahjong adds a game summary. The session
+advice). Fixes and undos are entries of their own, and the end of a game (Mahjong or a wall
+game) adds a game summary. The session
 view then reads as a replay, with heard lines, strategist asks and photo readings in between.
 
 A finished game is also scored as a whole, on its session: whether you won, how many moves it
@@ -48,6 +49,8 @@ def describe(event: dict[str, Any]) -> str:
             return f"{who} swaps for a joker"
         case "mahjong":
             return f"{who} declares Mahjong"
+        case "wall":
+            return "Wall game: the tiles ran out"
     return str(event.get("type"))
 
 
@@ -60,7 +63,7 @@ def record_move(game_id: str, index: int, event: dict[str, Any], view: dict[str,
         output=_position(view),
         metadata={"move": index + 1, **_source(event)},
     )
-    if event.get("type") == "mahjong":
+    if event.get("type") in ("mahjong", "wall"):
         record_summary(game_id, view)
 
 
@@ -93,7 +96,7 @@ def record_summary(game_id: str, view: dict[str, Any]) -> None:
     _score_game(game_id, winner, events, sources)
     _record(
         game_id,
-        f"Game over: {'you won' if winner == 1 else f'Player {winner} won'}",
+        f"Game over: {_result(winner)}",
         input={"players": view.get("players"), "cards": view.get("cards")},
         output={
             "winner": winner,
@@ -113,7 +116,7 @@ def record_summary(game_id: str, view: dict[str, Any]) -> None:
 def _score_game(
     game_id: str, winner: int | None, events: list[dict[str, Any]], sources: Counter[str]
 ) -> None:
-    """Scores on the whole game (the Langfuse session). Declaring Mahjong again after an undo
+    """Scores on the whole game (the Langfuse session). Ending the game again after an undo
     overwrites them."""
     discards = sources.total()
     scores: dict[str, float | bool] = {
@@ -129,6 +132,12 @@ def _score_game(
             record_score(langfuse, name, value, session_id=game_id, score_id=f"{game_id}-{name}")
     except Exception:
         log.warning("Couldn't score a game in Langfuse", exc_info=True)
+
+
+def _result(winner: int | None) -> str:
+    if winner is None:
+        return "wall game, nobody won"
+    return "you won" if winner == 1 else f"Player {winner} won"
 
 
 def _position(view: dict[str, Any]) -> dict[str, Any]:

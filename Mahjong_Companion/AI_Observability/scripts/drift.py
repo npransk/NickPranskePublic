@@ -10,8 +10,7 @@ model, prompt version or release (the usual cause). Nothing is written to Langfu
     uv run --env-file .env python scripts/drift.py --recent-days 30 --baseline-days 90
     uv run --env-file .env python scripts/drift.py --out data/private/reports/drift.md
 
-The exit code is 1 when something got worse, so a scheduled run can raise the alarm. Run
-scripts/judge.py first if you want the judge's scores to be current.
+The exit code is 1 when something got worse, so a scheduled run can raise the alarm.
 """
 
 from __future__ import annotations

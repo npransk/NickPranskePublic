@@ -1,6 +1,6 @@
 # 7. Measure every AI step the same way, and judge it with a local model
 
-Date: 2026-11-16 · Status: accepted
+Date: 2026-11-16 · Status: accepted; the local judge was replaced by the game review on 2026-11-17 ([ADR 8](0008-review-a-finished-game-with-claude.md)), the rest stands
 
 ## Context
 Every AI step already sent a trace to Langfuse, and the player's taps became three scores. That was not enough to answer "is the AI still as good, and as cheap, as it was?":

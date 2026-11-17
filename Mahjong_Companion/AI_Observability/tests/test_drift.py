@@ -221,7 +221,7 @@ def test_scores_become_quality_series_and_categories_become_shares():
         scores=[
             score("recommendation_followed", True),
             score("recommendation_followed", False),
-            score("judge_quality", 0.75),
+            score("strategist_hindsight", "poor"),
             score("tile_fixes", 2),
             score("heard_outcome", "auto"),
             score("heard_outcome", "fixed"),
@@ -232,7 +232,7 @@ def test_scores_become_quality_series_and_categories_become_shares():
     all_series, _ = drift.collect(archive, SINCE, UNTIL)
     found = by_name(all_series)
     assert found[("strategist", "picks the player followed")] == [1.0, 0.0]
-    assert found[("strategist", "judge: checks passed")] == [0.75]
+    assert found[("strategist", "picks the game review called poor")] == [1.0]
     assert found[("photo reading", "fixes per photo")] == [2.0]
     assert found[("table talk", "heard lines logged without asking")] == [1.0, 0.0]
     assert found[("table talk", "heard lines the player had to fix")] == [0.0, 1.0]

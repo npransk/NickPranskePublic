@@ -5,7 +5,16 @@
 from contextlib import contextmanager
 
 import pytest
-from mahjong_api import card_draft, games, listen, observability, playbyplay, strategist, vision
+from mahjong_api import (
+    card_draft,
+    games,
+    listen,
+    observability,
+    playbyplay,
+    review,
+    strategist,
+    vision,
+)
 
 LANGFUSE_SETTINGS = (
     "LANGFUSE_PUBLIC_KEY",
@@ -19,7 +28,7 @@ LANGFUSE_SETTINGS = (
     "CONTAINER_APP_NAME",
 )
 # Every module that looks the client up by name.
-MODULES = (observability, strategist, vision, listen, playbyplay, card_draft, games)
+MODULES = (observability, strategist, vision, listen, playbyplay, card_draft, games, review)
 # The real cached functions, kept so their caches can be cleared while a test has them replaced.
 CACHED = (observability.langfuse_client, observability.prompt_link)
 

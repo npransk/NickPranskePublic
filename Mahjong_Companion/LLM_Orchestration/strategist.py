@@ -11,8 +11,8 @@ One Langfuse trace per question (session = the game): an agent observation that 
 situation, a generation per Claude call and a tool observation per tool call (ADR 7). Checks that
 need no judgment are scored as soon as the answer is in: where the pick stood in the engine's
 ranking, whether the reason kept to its word limit, how many calls it took, how the ask ended.
-The player's "follow it" tap becomes ``recommendation_followed``, and the local judge adds its
-verdicts afterwards (``mahjong_api.judge``).
+The player's "follow it" tap becomes ``recommendation_followed``, and once the game is over the
+game review grades each pick with hindsight (``strategist_hindsight``, ``mahjong_api.review``).
 """
 
 from __future__ import annotations
@@ -121,7 +121,7 @@ class Pick:
     label: str
     reason: str
     trace_id: str | None
-    # What Claude looked up on the way (name, input, output), for judging the reason later.
+    # What Claude looked up on the way (name, input, output), shown with each regression run.
     tools: tuple[dict[str, Any], ...] = ()
 
 

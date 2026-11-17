@@ -6,8 +6,8 @@ Every AI step in the app records the same things the same way, so the Langfuse d
 drift report can compare like with like:
 
 - **Environment**: ``production`` (the Container App), ``development`` (a laptop), ``eval``
-  (scripts that measure a model on fixed inputs), ``judge`` (the local LLM judge) and
-  ``selftest`` (the wiring check). Real games are never mixed with test runs.
+  (scripts that measure a model on fixed inputs) and ``selftest`` (the wiring check). Real games
+  are never mixed with test runs.
 - **Release**: the git commit of the image (``LANGFUSE_RELEASE``, set when the image is built).
 - **Feature tag and session**: each trace is tagged with its feature and grouped by game.
 - **Prompt version**: a fingerprint of the prompt text, so a quality change can be tied to a
@@ -259,11 +259,11 @@ ScoreType = Literal["NUMERIC", "BOOLEAN", "CATEGORICAL"]
 @dataclass(frozen=True)
 class ScoreDef:
     """One score the app writes: its Langfuse type, what it means and who produces it
-    (``player``: a tap; ``code``: a deterministic check; ``judge``: the local LLM judge)."""
+    (``player``: a tap; ``code``: a deterministic check; ``review``: Claude's game review)."""
 
     name: str
     data_type: ScoreType
-    source: Literal["player", "code", "judge"]
+    source: Literal["player", "code", "review"]
     description: str
     min_value: float | None = None
     max_value: float | None = None
@@ -323,53 +323,42 @@ _SCORES = [
         "guard against invented hands at work).",
         min_value=0,
     ),
-    # The local LLM judge, on strategist picks
+    # The game review (Claude, once a game is over), on the strategist's picks and the game
     ScoreDef(
-        "judge_grounded",
-        "BOOLEAN",
-        "judge",
-        "Every number and tile the reason cites matches what the engine reported.",
+        "strategist_hindsight",
+        "CATEGORICAL",
+        "review",
+        "The game review's verdict on a strategist pick, knowing how the game went.",
+        categories=("good", "reasonable", "poor"),
     ),
     ScoreDef(
-        "judge_matches_pick",
-        "BOOLEAN",
-        "judge",
-        "The reason argues for the hand that was picked, not another candidate.",
-    ),
-    ScoreDef(
-        "judge_sound_choice",
-        "BOOLEAN",
-        "judge",
-        "The pick is the closest hand, or the reason gives a concrete case for a farther one.",
-    ),
-    ScoreDef(
-        "judge_clear",
-        "BOOLEAN",
-        "judge",
-        "One sentence to the player that names tiles and says what to do.",
-    ),
-    ScoreDef(
-        "judge_quality",
+        "review_play_score",
         "NUMERIC",
-        "judge",
-        "Share of the four judge checks a pick passed.",
-        min_value=0,
-        max_value=1,
+        "review",
+        "The game review's score for your play, 1 to 10, on the whole game.",
+        min_value=1,
+        max_value=10,
     ),
     ScoreDef(
-        "judge_agreement",
+        "review_outcome",
+        "CATEGORICAL",
+        "code",
+        "How a game review ended.",
+        categories=("reviewed", "refused", "error"),
+    ),
+    ScoreDef(
+        "review_dropped_refs",
         "NUMERIC",
         "code",
-        "Calibration: share of a hand-labelled answer's checks on which the judge agreed with "
-        "the label.",
+        "Points in a game review that cited a move or a strategist ask that doesn't exist, "
+        "dropped before showing it (the guard against invented moves at work).",
         min_value=0,
-        max_value=1,
     ),
     ScoreDef(
-        "judge_false_pass",
+        "review_helpful",
         "BOOLEAN",
-        "code",
-        "Calibration: the judge passed a check that the hand label fails (the costly mistake).",
+        "player",
+        'The player tapped "Useful" (or "Not useful") on a game review.',
     ),
     ScoreDef(
         "picked_closest",
@@ -478,7 +467,7 @@ def record_score(
 
     The type comes from ``SCORES``, so a score can't be written under two types. Nothing is
     written when there is nothing to attach it to (tracing switched off). ``environment`` is
-    for scores written from another process than the trace's (the judge): it files the score
+    for scores written from another process than the trace's (a script): it files the score
     with the trace it belongs to instead of with the process that wrote it.
     """
     definition = SCORES[name]

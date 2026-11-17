@@ -13,10 +13,11 @@ What it sets up (the definitions live in ``mahjong_api.langfuse_setup``):
 - each prompt's text under a ``sha-<fingerprint>`` label, so calls link to the prompt version
   that produced them. Run this after changing a prompt, or the new version's calls carry only
   the fingerprint;
-- the two fixed test sets as datasets (``strategist-positions``, ``judge-calibration``);
+- the fixed test set as a dataset (``strategist-positions``);
 - three dashboards: "Mahjong: AI quality", "Mahjong: cost and tokens" and "Mahjong: judge and
-  evals". The existing "Mahjong Companion" board is kept; its cost tiles stop double-counting
-  and it is limited to real games.
+  evals" (named before the judge was retired). Tiles added to them by hand are kept. The
+  existing "Mahjong Companion" board is kept; its cost tiles stop double-counting and it is
+  limited to real games.
 
 ``--check`` asks Langfuse each dashboard widget's question without creating anything, to catch
 a query Langfuse no longer accepts. ``--only`` limits the run to some parts.

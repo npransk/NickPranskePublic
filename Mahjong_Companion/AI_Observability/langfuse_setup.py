@@ -11,7 +11,9 @@
   prompt version, and what any fingerprint on an old trace actually said.
 - **Datasets**: the fixed test sets (``experiments``).
 - **Dashboards**: three boards next to the game-evening overview: is the AI still good, what
-  does it cost, and can the judge and the evals be trusted.
+  does it cost, and what do the fixed test sets say. A tile someone added to one of these
+  boards by hand is kept, below the tiles this module places; so are the local judge's tiles
+  from before it was retired (ADR 8).
 """
 
 from __future__ import annotations
@@ -20,13 +22,14 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from itertools import groupby
 from typing import Any
 
-from mahjong_api import card_draft, experiments, judge, strategist, vision
+from mahjong_api import card_draft, experiments, review, strategist, vision
 from mahjong_api.observability import SCORES, ScoreDef, prompt_label, sdk_quiet
 
 REAL_GAMES = ("production", "default")  # "default": recorded before environments were set
-TEST_RUNS = ("eval", "judge", "sdk-experiment")
+TEST_RUNS = ("eval", "sdk-experiment")
 PAUSE = 1.2  # seconds between writes: the dashboards API allows only a few a second
 
 
@@ -90,7 +93,7 @@ class PromptSpec:
 
 
 def prompts() -> list[PromptSpec]:
-    """Every prompt the app and the judge use, as the code has it now."""
+    """Every prompt the app uses, as the code has it now."""
     return [
         PromptSpec(
             strategist.PROMPT_NAME,
@@ -114,11 +117,11 @@ def prompts() -> list[PromptSpec]:
             ("card-draft",),
         ),
         PromptSpec(
-            judge.PROMPT_NAME,
-            judge.SYSTEM,
-            judge.RUBRIC_VERSION,
-            {"default_model": judge.DEFAULT_MODEL, "answer_schema": judge.SCHEMA},
-            ("judge",),
+            review.PROMPT_NAME,
+            review.SYSTEM,
+            review.PROMPT_VERSION,
+            {"model": review.MODEL, "effort": review.EFFORT, "answer_schema": review.SCHEMA},
+            ("review",),
         ),
     ]
 
@@ -270,19 +273,18 @@ def _number(name: str, description: str, view: str, score: str) -> Widget:
 
 QUALITY = Board(
     "Mahjong: AI quality",
-    "Is the AI still doing a good job? The local judge's verdicts, the checks that need no "
-    "judgment and your own taps, for real games only.",
+    "Is the AI still doing a good job? The game review's verdicts on strategist picks, the "
+    "checks that need no judgment and your own taps, for real games only.",
     REAL_GAMES,
     (
         (
             3,
             (
                 _number(
-                    "Judge: checks passed",
-                    "Average share of the four judge checks a strategist pick passed "
-                    "(judge_quality).",
-                    "scores-numeric",
-                    "judge_quality",
+                    "Reviews you found useful",
+                    'Share of game reviews you tapped "Useful" on (review_helpful).',
+                    "scores-boolean",
+                    "review_helpful",
                 ),
                 _number(
                     "Picks you followed",
@@ -311,16 +313,15 @@ QUALITY = Board(
             6,
             (
                 Widget(
-                    "Judge checks over time",
-                    "Daily pass rate of each judge check: grounded, matches the pick, sound "
-                    "choice, clear. A falling line is the first sign of drift.",
-                    "scores-boolean",
-                    "LINE_TIME_SERIES",
-                    (("value", "avg"),),
-                    ("name",),
-                    scores(
-                        "judge_grounded", "judge_matches_pick", "judge_sound_choice", "judge_clear"
-                    ),
+                    "Strategist picks in hindsight",
+                    "The game review's verdict on each strategist pick once the game was over: "
+                    "good, reasonable or poor (strategist_hindsight). More poor is the first "
+                    "sign of drift.",
+                    "scores-categorical",
+                    "PIE",
+                    (("count", "count"),),
+                    ("stringValue",),
+                    scores("strategist_hindsight"),
                 ),
                 Widget(
                     "Your taps over time",
@@ -372,14 +373,13 @@ QUALITY = Board(
             6,
             (
                 Widget(
-                    "Judge quality by prompt version",
-                    "Average judge_quality for each fingerprint of the strategist's prompt: "
-                    "did the last prompt edit help?",
+                    "Your play, game by game",
+                    "Daily average of the game review's 1-10 score for your play "
+                    "(review_play_score).",
                     "scores-numeric",
-                    "VERTICAL_BAR",
+                    "LINE_TIME_SERIES",
                     (("value", "avg"),),
-                    ("traceVersion",),
-                    scores("judge_quality"),
+                    filters=scores("review_play_score"),
                 ),
                 Widget(
                     "Strategist effort per ask",
@@ -473,8 +473,8 @@ COST = Board(
             (
                 Widget(
                     "Cost per day by call",
-                    "claude: the strategist and card drafting; read-hand: photo reading; jev: "
-                    "unclear table talk.",
+                    "claude: the strategist and card drafting; read-hand: photo reading; "
+                    "review: game reviews; jev: unclear table talk.",
                     "observations",
                     "BAR_TIME_SERIES",
                     (("totalCost", "sum"),),
@@ -484,7 +484,7 @@ COST = Board(
                 Widget(
                     "Cost by feature",
                     "Cost by the kind of trace the call belongs to: strategist, read-hand, "
-                    "heard, draft-card.",
+                    "heard, draft-card, review-game.",
                     "observations",
                     "HORIZONTAL_BAR",
                     (("totalCost", "sum"),),
@@ -572,28 +572,15 @@ COST = Board(
 )
 
 TRUST = Board(
+    # The name it was created under: boards are matched by name, so renaming would make another.
     "Mahjong: judge and evals",
-    "Can the judge and the fixed test sets be trusted, and what do they say? Calibration, "
-    "regression runs and eval scripts only: no real games.",
+    "What do the fixed test sets say? Regression runs and eval scripts only: no real games. "
+    "The judge tiles below these are from the local judge retired in ADR 8 and get no new data.",
     TEST_RUNS,
     (
         (
             3,
             (
-                _number(
-                    "Judge agrees with labels",
-                    "Calibration: average share of hand-labelled checks the judge agreed with "
-                    "(judge_agreement).",
-                    "scores-numeric",
-                    "judge_agreement",
-                ),
-                _number(
-                    "Judge passed a broken answer",
-                    "Calibration: share of labelled answers where the judge passed a check the "
-                    "label fails (judge_false_pass). The costly mistake.",
-                    "scores-boolean",
-                    "judge_false_pass",
-                ),
                 _number(
                     "Fixed positions: closest picked",
                     "Regression set: share of the nine fixed positions where the strategist "
@@ -613,16 +600,6 @@ TRUST = Board(
             6,
             (
                 Widget(
-                    "Judge calibration over time",
-                    "Each calibration run's agreement and false-pass rate. A drop after "
-                    "updating the judge model means it got worse at judging.",
-                    "scores-numeric",
-                    "LINE_TIME_SERIES",
-                    (("value", "avg"),),
-                    ("name",),
-                    scores("judge_agreement", "judge_false_pass"),
-                ),
-                Widget(
                     "Fixed positions over time",
                     "Each regression run on the same nine positions. The inputs never change, "
                     "so a move here is the model or the prompt.",
@@ -630,29 +607,16 @@ TRUST = Board(
                     "LINE_TIME_SERIES",
                     (("value", "avg"),),
                     ("name",),
-                    scores("picked_closest", "reason_within_limit", "judge_quality"),
-                ),
-            ),
-        ),
-        (
-            6,
-            (
-                Widget(
-                    "Judge: time per verdict",
-                    "Median milliseconds the local model takes per verdict, per day.",
-                    "observations",
-                    "LINE_TIME_SERIES",
-                    (("latency", "p50"),),
-                    filters=(GENERATIONS, one_of("name", "judge")),
+                    scores("picked_closest", "reason_within_limit"),
                 ),
                 Widget(
-                    "Judge: tokens per verdict",
-                    "Average tokens in plus out per verdict, per day. The judge's own use is "
-                    "watched like any other model's.",
+                    "Cost of test runs",
+                    "What the eval scripts and regression runs spent on Claude.",
                     "observations",
-                    "LINE_TIME_SERIES",
-                    (("totalTokens", "avg"),),
-                    filters=(GENERATIONS, one_of("name", "judge")),
+                    "BAR_TIME_SERIES",
+                    (("totalCost", "sum"),),
+                    ("name",),
+                    (GENERATIONS,),
                 ),
             ),
         ),
@@ -661,20 +625,10 @@ TRUST = Board(
             (
                 Widget(
                     "Test runs per day",
-                    "Model calls made by eval scripts, regression runs and the judge.",
+                    "Model calls made by eval scripts and regression runs.",
                     "observations",
                     "BAR_TIME_SERIES",
                     (("count", "count"),),
-                    ("name",),
-                    (GENERATIONS,),
-                ),
-                Widget(
-                    "Cost of test runs",
-                    "What the eval scripts and regression runs spent on Claude. The local judge "
-                    "costs nothing.",
-                    "observations",
-                    "BAR_TIME_SERIES",
-                    (("totalCost", "sum"),),
                     ("name",),
                     (GENERATIONS,),
                 ),
@@ -735,9 +689,33 @@ def check_boards(langfuse: Any) -> list[str]:
     return problems
 
 
+TILE_KEYS = ("type", "id", "widgetId", "x", "y", "width", "height")
+
+
+def with_kept_tiles(layout: list[dict[str, Any]], current: list[dict[str, Any]]) -> list[dict]:
+    """``layout`` (this module's tiles) followed by the tiles already on the board that show a
+    widget this module doesn't place there: in their own order and columns, moved below, one
+    row after another with no gaps."""
+    ours = {tile["widgetId"] for tile in layout}
+    kept = [
+        {key: tile.get(key) for key in TILE_KEYS}
+        for tile in current
+        if tile.get("widgetId") not in ours
+    ]
+    kept.sort(key=lambda tile: (tile["y"], tile["x"]))
+    y = max((tile["y"] + tile["height"] for tile in layout), default=0)
+    moved = []
+    for _, row in groupby(kept, key=lambda tile: tile["y"]):
+        row = list(row)
+        moved += [{**tile, "y": y} for tile in row]
+        y += max(tile["height"] for tile in row)
+    return layout + moved
+
+
 def sync_boards(langfuse: Any) -> dict[str, list[str]]:
     """Create or update the three boards and their widgets, matched by name. Widgets and
-    boards this module doesn't name are left alone."""
+    boards this module doesn't name are left alone, and so are tiles on these boards that it
+    doesn't place: they move below its own."""
     api = langfuse.api.unstable
     widgets = {w.name: w for w in _everything(api.dashboard_widgets.list)}
     boards = {b.name: b for b in _everything(api.dashboards.list)}
@@ -757,8 +735,13 @@ def sync_boards(langfuse: Any) -> dict[str, list[str]]:
                 _write(api.dashboard_widgets.update, wanted, current.id)
                 ids[widget.name] = current.id
                 done["updated"].append(widget.name)
-        layout = {"widgets": board.placements(ids)}
         current = boards.get(board.name)
+        have = _plain(current) if current is not None else {}
+        placed = [
+            {key: tile.get(key) for key in TILE_KEYS}
+            for tile in have.get("definition", {}).get("widgets", [])
+        ]
+        layout = {"widgets": with_kept_tiles(board.placements(ids), placed)}
         if current is None:
             _write(
                 api.dashboards.create,
@@ -771,11 +754,6 @@ def sync_boards(langfuse: Any) -> dict[str, list[str]]:
             )
             done["created"].append(board.name)
         else:
-            have = _plain(current)
-            keys = ("type", "id", "widgetId", "x", "y", "width", "height")
-            placed = [
-                {key: tile.get(key) for key in keys} for tile in have["definition"]["widgets"]
-            ]
             same = (
                 placed == layout["widgets"]
                 and have.get("description") == board.description
@@ -833,8 +811,8 @@ def correct_overview(langfuse: Any) -> list[str]:
       game: every score on a trace was dropped, so the tiles showed no real data.
     - Its chart of every score's daily average is kept to the three 0-1 accuracy scores it was
       drawn for, now that scores on other scales exist.
-    - It had no environment filter, so eval runs, the judge and self-tests would show up in its
-      game counts and accuracy tiles.
+    - It had no environment filter, so eval runs and self-tests would show up in its game counts
+      and accuracy tiles.
     """
     api = langfuse.api.unstable
     board = next((b for b in _everything(api.dashboards.list) if b.name == OVERVIEW), None)

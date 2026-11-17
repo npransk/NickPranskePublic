@@ -8,7 +8,7 @@ app recorded in Langfuse and compares two windows of time:
 
 - **Use**: prompt and output tokens, cost and latency per call, and per strategist ask.
 - **Quality**: every score, from the player's taps, the checks that need no judgment and the
-  local judge.
+  game review's verdicts on strategist picks.
 
 A change is only called drift when it is both large (15% for use, 10 points for a pass rate) and
 unlikely to be chance (a permutation test, corrected for the number of metrics tested at once).
@@ -182,11 +182,6 @@ def compare(
 # Score name -> (feature, what it measures, which direction is worse, scale).
 SCORES: dict[str, tuple[str, str, Worse, str]] = {
     "recommendation_followed": ("strategist", "picks the player followed", "down", "absolute"),
-    "judge_quality": ("strategist", "judge: checks passed", "down", "absolute"),
-    "judge_grounded": ("strategist", "judge: reason is grounded", "down", "absolute"),
-    "judge_matches_pick": ("strategist", "judge: reason matches the pick", "down", "absolute"),
-    "judge_sound_choice": ("strategist", "judge: sound choice", "down", "absolute"),
-    "judge_clear": ("strategist", "judge: reason is clear", "down", "absolute"),
     "reason_within_limit": ("strategist", "reasons within the word limit", "down", "absolute"),
     "reason_words": ("strategist", "words per reason", None, "relative"),
     "pick_engine_rank": ("strategist", "engine rank of the pick", None, "relative"),
@@ -201,10 +196,17 @@ SCORES: dict[str, tuple[str, str, Worse, str]] = {
     "discards_auto_logged": ("games", "discards logged without a tap", "down", "absolute"),
     "game_fixed_moves": ("games", "moves fixed per game", "up", "relative"),
     "game_won": ("games", "games won", None, "absolute"),
+    "review_play_score": ("games", "review score of your play", None, "relative"),
+    "review_helpful": ("game review", "reviews you found useful", "down", "absolute"),
+    "review_dropped_refs": ("game review", "invented moves per review", "up", "relative"),
 }
 # Category scores, as the share of one value: score -> [(value, what it measures, worse)].
 SHARES: dict[str, list[tuple[str, str, str, Worse]]] = {
     "strategist_outcome": [("picked", "strategist", "asks that ended in a pick", "down")],
+    "strategist_hindsight": [
+        ("poor", "strategist", "picks the game review called poor", "up"),
+    ],
+    "review_outcome": [("reviewed", "game review", "reviews that finished", "down")],
     "heard_outcome": [
         ("auto", "table talk", "heard lines logged without asking", "down"),
         ("fixed", "table talk", "heard lines the player had to fix", "up"),
@@ -221,8 +223,8 @@ def feature_of(observation: Any) -> str | None:
         return "photo reading"
     if name == "jev":
         return "table talk"
-    if name == "judge":
-        return "judge"
+    if name == "review":
+        return "game review"
     if name == "claude" or name.startswith("claude-round"):
         drafting = getattr(observation, "trace_name", None) == "draft-card"
         return "card drafting" if drafting else "strategist"

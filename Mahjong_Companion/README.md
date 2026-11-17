@@ -80,15 +80,12 @@ flowchart LR
     claude["Claude<br/>Sonnet 5.5 / Opus 5.5"]
     jev["Jev<br/>(TypeSafe)"]
     langfuse["Langfuse<br/>traces and scores"]
-    judge["Local judge<br/>open model on my desktop"]
 
     phone -- "taps, photos, heard lines" --> api
     phone -- "microphone audio out, text back" --> speech
-    api -- "strategist, photo reading" ----> claude
+    api -- "strategist, photo reading,<br/>game review" ----> claude
     api -- "unclear table talk" ----> jev
     api -- "a trace per AI action,<br/>a score per player tap" ----> langfuse
-    langfuse -- "picks to grade" --> judge
-    judge -- "verdicts as scores" --> langfuse
 ```
 
 | Job | Done by |
@@ -102,12 +99,14 @@ flowchart LR
 | **Reading tiles from a photo** | Claude vision, limited by schema to the 36 tile names |
 | **Drafting a new year's card from a photo** | Claude, checked by the engine's validator in a loop |
 | **Turning table talk into events** | Grammar parser first, a small typed model (Jev) for unclear lines |
+| Replaying a finished game: what the engine would have done at each of my moves, and how each strategist pick fared | Engine |
+| **Coaching me on that game, and grading the strategist with hindsight** | Claude, told only what the engine's replay found |
 
 ---
 
 ## Part 1: LLM orchestration
 
-There are four AI jobs, and each one has a different shape. I picked the smallest pattern that does the job, and the cheapest model that does it well.
+There are five AI jobs, and each one has a different shape. I picked the smallest pattern that does the job, and the cheapest model that does it well.
 
 | Job | Pattern | Model | Kept honest by |
 | --- | --- | --- | --- |
@@ -115,6 +114,7 @@ There are four AI jobs, and each one has a different shape. I picked the smalles
 | [Photo reading](#reading-a-rack-photo-structured-output-not-free-text) | One call, structured output | Claude Sonnet 5.5 vision, low effort | A JSON schema that only allows the 36 real tile names |
 | [Card drafting](#drafting-the-yearly-card-generate-validate-repair) | Generate, validate, repair | Claude Opus 5.5, high effort | The engine's validator, up to 4 rounds, then my review |
 | [Table talk](#table-talk-rules-first-a-small-model-for-the-leftovers) | Cascade: rules, then a small model | Grammar parser, then Jev | Typed answers with probabilities, a measured cut-off, and my confirm tap |
+| [Score My Game](#score-my-game-claude-reviews-the-finished-game) | Engine replay, then one call with structured output | Claude Opus 5.5, medium effort | Sees only the engine's facts; any move or ask it cites must exist (Part 2) |
 
 ### The strategist: an agent that can only pick from the engine's list
 
@@ -153,7 +153,7 @@ sequenceDiagram
     A-)L: Scores that need no judgment (rank of the pick, words in the reason, calls)
     P->>A: I'll go for it, or Not this one
     A-)L: Score recommendation_followed
-    Note over L: After the game, a local judge model grades the reason (Part 2)
+    Note over L: After the game, Score My Game grades the pick with hindsight (Part 2)
 ```
 
 What makes it an orchestration problem rather than a prompt:
@@ -291,15 +291,15 @@ Everything the AI does is recorded in [Langfuse](https://langfuse.com). The firs
 ```mermaid
 flowchart LR
     app["App in Azure"]
+    review["Score My Game<br/>engine replay + Claude Opus"]
     langfuse[("Langfuse<br/>traces, scores,<br/>prompts, datasets")]
-    judge["Local judge<br/>open model on my desktop"]
     drift["Drift report<br/>recent vs baseline"]
     sets["Fixed test sets<br/>made-up positions"]
     boards["Dashboards"]
 
     app -- "traces, tap scores,<br/>code-check scores" --> langfuse
-    langfuse -- "picks to grade" --> judge
-    judge -- "four verdicts per pick" --> langfuse
+    app -- "a finished game" --> review
+    review -- "my play score,<br/>a verdict on each pick" --> langfuse
     langfuse -- "calls and scores" --> drift
     sets -- "experiment runs" --> langfuse
     langfuse --> boards
@@ -308,8 +308,8 @@ flowchart LR
 | Question | Answered by |
 | --- | --- |
 | What happened in this game, step by step? | [One trace per AI action](#one-trace-per-ai-action-one-session-per-game) and [the play-by-play](#the-game-as-a-play-by-play) |
-| Was each answer any good? | [Three kinds of score](#three-kinds-of-score), one of them from [a local judge model](#a-local-model-as-the-judge) |
-| Can I trust the judge? | [Judging the judge](#judging-the-judge) |
+| Was each answer any good? | [Three kinds of score](#three-kinds-of-score), one of them from [the game review](#score-my-game-claude-reviews-the-finished-game) |
+| Can I trust the review? | [Keeping the reviewer honest](#keeping-the-reviewer-honest) |
 | Has anything changed over time? | [Drift](#drift-has-anything-changed) |
 | Where do I look? | [Dashboards](#dashboards-and-a-langfuse-project-kept-in-code) |
 
@@ -336,16 +336,20 @@ draft-card                agent        session: the card's year       out: round
 ├─ validate               tool         out: hands parsed and the list of problems
 ├─ claude                 generation
 └─ validate               tool         out: no problems
+
+review-game               evaluator    in: moves, strategist picks    out: the review
+├─ hindsight              span         the engine's replay: passes, discards, call chances, picks
+└─ review                 generation   claude-opus-5-5, effort medium, a fixed JSON shape
 ```
 
 Every trace also carries the same six labels. They are set in one place, [`AI_Observability/observability.py`](AI_Observability/observability.py), so no feature can forget one:
 
 | Label | Values | Why it matters |
 | --- | --- | --- |
-| Environment | `production`, `development`, `eval`, `judge`, `selftest` | Real games never mix with test runs |
+| Environment | `production`, `development`, `eval`, `selftest` | Real games never mix with test runs |
 | Release | The git commit of the deployed image | A change can be tied to a deploy |
 | Session | The game's ID | One game is one timeline |
-| Tag | `strategist`, `vision`, `table-talk`, `card-draft`, `play-by-play`, `judge` | Cost and quality per feature |
+| Tag | `strategist`, `vision`, `table-talk`, `card-draft`, `play-by-play`, `review` | Cost and quality per feature |
 | Prompt version | A fingerprint of the prompt text, linked to the prompt registered in Langfuse | A change can be tied to a prompt edit |
 | Player | A hash of the signed-in account | Per-player numbers, without the account ID leaving the app |
 
@@ -365,7 +369,7 @@ The app never asks me to rate anything. Scores come from three places, and each 
 | --- | --- | --- |
 | My taps | `recommendation_followed`, `tile_fixes`, `discard_parse_correct`, `heard_outcome` | Was it useful to me? |
 | Checks in code | `pick_engine_rank`, `reason_within_limit`, `strategist_rejected_picks`, `discards_auto_logged` | Did it do what it was told? |
-| A local judge model | `judge_grounded`, `judge_matches_pick`, `judge_sound_choice`, `judge_clear` | Was the reason true and sensible? |
+| The game review | `strategist_hindsight`, `review_play_score` | Did the pick hold up, and how well did I play? |
 
 **My taps.** The buttons I would press anyway are the feedback:
 
@@ -375,6 +379,7 @@ The app never asks me to rate anything. Scores come from three places, and each 
 | `tile_cv_correct`, `tile_fixes` | confirm my tiles after a photo | share of tiles it read right, and how many I changed | How many fixes does a photo need? |
 | `discard_parse_correct`, `heard_outcome` | confirm, fix or ignore a heard line (or leave an auto-logged one alone) | 1 or 0, and which of the four I did | How often is a discard logged with no correction? |
 | `card_draft_accuracy` | run the card drafter against a known card | share of hands right | Can I trust a draft of next year's card? |
+| `review_helpful` | tap "Useful" or "Not useful" under a game review | 1 or 0 | Is the reviewer worth what it costs? |
 
 One detail I like: a discard that was logged automatically is scored 1 straight away, but its score has a fixed ID. If I later press **Change** on it, the same score is overwritten with 0. So "auto-logged and never corrected" and "auto-logged, then fixed" are told apart without any extra bookkeeping. Every score now works this way: one of each kind per trace, and scoring again overwrites.
 
@@ -388,6 +393,7 @@ One detail I like: a discard that was logged automatically is scored 1 straight 
 | `strategist_rejected_picks` | Times it named a hand outside the candidates before settling | Is the guard against invented hands doing any work? |
 | `tiles_uncertain` | Tiles a photo reading flagged for me to check | Is it unsure about the tiles I end up fixing? |
 | `game_won`, `discards_auto_logged`, `game_fixed_moves` | Whole-game numbers, scored on the session | How much of a game logs itself? |
+| `review_dropped_refs` | Points in a game review that cited a move or a strategist ask that doesn't exist | Is the reviewer making things up? |
 
 Every score is declared once, with its type and meaning, and nothing can be written under a name that isn't on the list. From [`AI_Observability/observability.py`](AI_Observability/observability.py):
 
@@ -402,82 +408,73 @@ ScoreDef(
 ),
 ```
 
-### A local model as the judge
+### Score My Game: Claude reviews the finished game
 
-A tap tells me whether I followed a pick. It does not tell me whether the reason was true. "Go for this hand because you need only 2 tiles" sounds just as convincing when the engine said 4.
+A tap tells me whether I followed a pick. It doesn't tell me whether the pick was any good, and nothing told me how well *I* played. So a finished game has a **Score My Game** button.
 
-So a second model grades the strategist. It is an open model (Gemma 4 12B in Google's own 4-bit build, about 8 GB) served by [Ollama](https://ollama.com) on my desktop. After a game night, [`scripts/judge.py`](AI_Observability/scripts/judge.py) reads the strategist's picks back from Langfuse, grades each one against what the strategist was shown, and writes the verdicts onto the pick's trace as scores. The judge is built and tested; its first run against the real model is the next step ([Where it stands](#where-it-stands)).
+<p align="center">
+  <img src="Images/score_my_game.png" alt="A game review: 5 out of 10 for my play, a summary, what went well, the move that mattered, and the strategist's pick graded good" width="330"><br/>
+  <em>A wall game, reviewed: a score for my play, the move that cost me, and the strategist's pick judged with hindsight.</em>
+</p>
 
-| Check | Passes when |
-| --- | --- |
-| `grounded` | Every number and tile the reason states is true of the picked hand, my tiles or the table |
-| `matches_pick` | The reason argues for the hand that was picked, not another candidate |
-| `sound_choice` | The pick is the closest hand, or the reason names a real advantage that the engine's numbers confirm |
-| `clear` | One sentence, addressed to me, that names a hand and backs it with a tile or a number |
+<sub>As with the strategist above, this was captured without an API key: the review's wording is a placeholder from a scripted stand-in, written to match what the engine's replay found for this game (move 4: the engine suggested the 9 bam; the 3 bam left me 5 tiles away instead of 4). The real reviews come from Claude.</sub>
 
-The design choices, and why:
+It works the same way as everything else here: **the engine counts, the AI judges.**
 
-- **A different model family from the one being judged.** Claude writes the pick and Gemma grades it, so the judge shares none of Claude's habits. It also costs nothing per call, and my game data goes nowhere new.
-- **A batch job on the desktop, not a service.** The Container App is half a CPU that scales to zero; it cannot hold a model. So judging happens after the game, and the scores arrive then.
-- **Pass or fail on one thing at a time.** Small models are steadier on four narrow yes/no questions than on one grade out of ten.
-- **Evidence before verdict.** The answer is a fixed JSON shape in which each check's `evidence` comes before its `pass`, so the verdict follows from what the judge found rather than the other way round.
-- **The counting is done for it.** Small models judge better than they count. The tiles I hold and which candidate is closest are worked out in code and handed over as facts.
-- **Every verdict is stamped** with the judge model and a fingerprint of the rubric, so a change in scores can be told apart from a change of judge.
-- **The judge is traced like any other model**: its tokens and its seconds per verdict have their own charts.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Phone
+    participant A as API
+    participant E as Rules engine
+    participant C as Claude Opus 5.5
+    participant L as Langfuse
 
-This is the end of what the judge is shown for one answer (a made-up position on the sample card):
-
-```
-## Facts worked out for you
-The player's tiles, counted: 3x 3 bam, 1x 9 bam, 3x 3 crak, 1x 7 crak, 2x 3 dot, 1x 6 dot, 2x flower.
-The picked hand needs 4 tiles, the fewest of the 5 candidates.
-
-## The assistant's answer
-Picked hand: 1999-LIKE-1 ("Sample Like Numbers, top line")
-The picked hand's row from the engine: {"hand_id": "1999-LIKE-1", ..., "tiles_needed": 4, "outs": 12, ...}
-Reason given to the player: "Go for like numbers in 3s because you need only 2 tiles and have 20 outs with your 3 bams and 3 craks."
-
-Judge this answer.
+    P->>A: Score My Game
+    A->>E: Replay the game, with the strategist's picks
+    E-->>A: At each pass and discard: the engine's choice, mine, and what each left me<br/>Call chances, missed Mahjong, how each pick fared
+    A->>C: Those facts and nothing else, plus a JSON schema for the answer
+    C-->>A: Score out of 10, moments that mattered, a verdict per pick, one thing to work on
+    Note over A: Drop any point citing a move or an ask that doesn't exist
+    A-->>P: The review, kept with the game
+    A-)L: One trace, the play score on the game, a verdict on each pick's own trace
+    P->>A: Useful, or Not useful
+    A-)L: Score review_helpful
 ```
 
-A careful judge fails this on `grounded` (the engine says 4 tiles and 12 outs, not 2 and 20) and passes the other three: the reason is about the right hand, the hand is the closest, and the sentence is clear. It is just wrong. Code: [`AI_Observability/judge.py`](AI_Observability/judge.py).
+1. **The engine replays the game** ([`hindsight.py`](AI_Observability/hindsight.py)). At each Charleston pass and each of my discards it records:
+   - what the engine would have done;
+   - what I did;
+   - how far my closest hand was afterwards, either way.
 
-#### Judging the judge
+   It also lists the discards I could have called, any Mahjong I had and didn't declare, and the discards an opponent's likely hand needed. For each time I asked the strategist, it records where that hand stood, which of its tiles turned up later and whether it was still possible at the end. The strategist's picks and my "I'll go for it" taps are now saved with the game for this.
+2. **Claude Opus 5.5 gets those facts and nothing else** ([`review.py`](AI_Observability/review.py)). The prompt asks it to score decisions, not luck (a well-played game can be lost to the draw). It is also told the engine is a guide, not an oracle: keeping a tile an opponent needs can beat the engine's discard. The answer is a fixed JSON shape:
+   - a score out of 10 for my play;
+   - what went well;
+   - the 3 to 5 moves that mattered;
+   - a good, reasonable or poor verdict on each strategist pick, judged on what could be known when I asked, not on how the draw went;
+   - one thing to work on.
+3. **The review is kept with the game**, so reopening it costs nothing; "Score again" replaces it.
 
-A judge I haven't measured is just a second opinion with a confident tone. So before its scores count, `judge.py calibrate` runs it on 18 answers that I labelled by hand: made-up positions on the sample card, six good answers and twelve broken on purpose.
+#### Keeping the reviewer honest
 
-| The answer says | What is wrong with it | Should fail |
-| --- | --- | --- |
-| "...you need only 2 tiles and have 20 outs..." | The engine says 4 and 12 | `grounded` |
-| "...your pair of jokers and three 3 bams..." | There is no joker in the hand | `grounded` |
-| "...your joker can stand in for the 8 dot." | A joker can never be a single tile | `grounded` |
-| "...Player 2 has thrown three green dragons..." | The opponent read shows Player 2 has discarded nothing | `grounded` |
-| "Go for the evens hand..." when the pick was like numbers | It argues for a different hand | `matches_pick`, `grounded` |
-| A hand 10 tiles away "because you already hold three 3 bams" | True, but it names no advantage over the hand 4 away | `sound_choice` |
-| "This one is the best choice for you right now." | Nothing false, and nothing said | `clear` |
+- **It can only cite what the engine found.** Every number in its input comes from the replay. Any moment or verdict that points at a move or an ask that doesn't exist is dropped before I see it, and counted (`review_dropped_refs`).
+- **A stronger model grades a weaker one.** The strategist is Claude Sonnet 5.5; the reviewer is Claude Opus 5.5. It is still Claude grading Claude, which is why it only gets the engine's facts and why my own "Useful?" tap is scored too.
+- **The verdicts land where they are useful.** Each strategist verdict is written onto that pick's own trace (`strategist_hindsight`), so the strategist's dashboards show how its picks held up. The play score goes on the game (`review_play_score`), next to whether I won.
+- **It costs money, once a game.** About $0.10 to $0.20 a review, by my estimate; the first real reviews will measure it.
 
-Two of the good answers pick a hand that is *not* the closest and say why, with a reason the engine's numbers confirm. They are there to catch the opposite mistake: a judge that fails anything unusual.
+Code: [`AI_Observability/review.py`](AI_Observability/review.py), [`AI_Observability/hindsight.py`](AI_Observability/hindsight.py), and the tests in [`tests/test_review.py`](AI_Observability/tests/test_review.py) and [`tests/test_hindsight.py`](AI_Observability/tests/test_hindsight.py).
 
-Each label is pinned to the engine's numbers it was written against, so if the engine ever changes them, a test fails instead of a label quietly going stale. The report gives agreement, Cohen's kappa (agreement beyond chance) and false passes for each check. Here is what it prints for a stand-in that passes everything, which is what an unmeasured judge might be:
+#### Why not a local judge
 
-```
-Judge a-judge-that-passes-everything, rubric bf93c7e9: 18 answers x 1
-check           agreed   kappa  passed a fail  failed a pass
-grounded         10/18    0.00              8              0
-matches_pick     15/18    0.00              3              0
-sound_choice     12/15    0.00              3              0
-clear            15/18    0.00              3              0
-Overall agreement 75%, 18 s of judging.
-Where the judge and the labels differ:
-  threes-wrong-numbers / grounded: the judge passed it. Looks fine.
-  threes-invented-jokers / grounded: the judge passed it. Looks fine.
-  ...
-Not fit to judge at the 80% bar.
-```
+My first design was different. An open model (Gemma 4 12B) on my desktop would grade each strategist pick on four pass/fail checks, calibrated against 18 answers I had labelled by hand. I built it and tested it against a stand-in. Before ever running it on the real model, I asked whether it was the right call, and decided it wasn't:
 
-"75% agreement" sounds respectable until the kappa column says 0.00: no better than chance. That is why the report leads with kappa and false passes, not with the headline number.
+- A 12B model reasons less well than the Sonnet strategist it was grading.
+- It graded one sentence without knowing how the game went.
+- It needed my desktop and a calibration run before any score meant anything, and with a game or two a week it would have had very little to grade.
+- It told me nothing at the table.
 
-<sub>That report is real output from the calibration code, run with a scripted stand-in so the shape is visible. The judge itself is tested against a stand-in for Ollama's API; its first calibration on the real model, on my desktop, is the next step (see <a href="#where-it-stands">Where it stands</a>).</sub>
+So I replaced it with the review ([Design decision 8](Design_Decisions/0008-review-a-finished-game-with-claude.md)). Its prompt, dataset and score definitions are still in my Langfuse project, unused. The dashboard setup now keeps tiles it doesn't place itself, so its old tiles weren't wiped.
 
 ### Drift: has anything changed?
 
@@ -524,7 +521,7 @@ The report found a change I hadn't gone looking for: the share of heard lines th
 | I called four north winds | Only one hand is left to choose |
 | Like numbers in 7s is closest, but the 7s keep getting discarded | Whether it reads the table, not just the distance |
 
-Each run is recorded as a Langfuse experiment on a dataset, and Langfuse lines the runs up side by side. When two runs differ, the system changed, not the games. A run costs about ten cents. The judge's 18 labelled answers are a dataset too, so the judge itself is re-measured after a model update. Code: [`AI_Observability/evalset.py`](AI_Observability/evalset.py) and [`AI_Observability/experiments.py`](AI_Observability/experiments.py).
+Each run is recorded as a Langfuse experiment on a dataset, and Langfuse lines the runs up side by side. When two runs differ, the system changed, not the games. A run costs about ten cents. Code: [`AI_Observability/evalset.py`](AI_Observability/evalset.py) and [`AI_Observability/experiments.py`](AI_Observability/experiments.py).
 
 ### The game as a play-by-play
 
@@ -549,7 +546,7 @@ score  recommendation_followed = 1
 
 <sub>This is what the app recorded for the game in the screenshots above, condensed to a line each. I ran the real code locally with Langfuse swapped for a recorder and the model for the test suite's stand-in, so the names, nesting, sources and scores are the ones the deployed app sends.</sub>
 
-When someone declares Mahjong, a "Game over" summary is added (who won, how many moves, how many discards were tapped versus heard), the game is scored as a whole on its session, and the trace buffer is flushed, because the app may scale to zero seconds later. Recording can never break a game: any Langfuse error is logged and swallowed. Code: [`AI_Observability/playbyplay.py`](AI_Observability/playbyplay.py).
+When the game ends (someone declares Mahjong, or nobody does and the tiles run out), a "Game over" summary is added (who won, how many moves, how many discards were tapped versus heard), the game is scored as a whole on its session, and the trace buffer is flushed, because the app may scale to zero seconds later. Recording can never break a game: any Langfuse error is logged and swallowed. Code: [`AI_Observability/playbyplay.py`](AI_Observability/playbyplay.py).
 
 ### Dashboards, and a Langfuse project kept in code
 
@@ -557,15 +554,15 @@ A Langfuse project collects settings that nobody remembers making. So mine are i
 
 - **A definition for every score**: its type, range and meaning, so Langfuse explains each score where it shows it.
 - **Every prompt, mirrored under a fingerprint.** The prompt text stays in the code, where the tests are. The script registers each version in Langfuse under a `sha-<fingerprint>` label, and the app links each call to it. Langfuse can then show cost, latency and scores per prompt version, and what any old fingerprint actually said.
-- **The two test sets** as datasets.
+- **The fixed positions** as a dataset.
 - **Four dashboards:**
 
 | Board | What it shows |
 | --- | --- |
 | Mahjong Companion | One evening at a glance: games, moves, accuracy, cost |
-| Mahjong: AI quality | The judge's verdicts over time and by prompt version, picks followed, engine rank of the pick, how asks end, fixes per photo |
+| Mahjong: AI quality | Strategist picks in hindsight, reviews I found useful, my play score game by game, picks followed, engine rank of the pick, how asks end, fixes per photo |
 | Mahjong: cost and tokens | Cost by feature, call and model, tokens and latency per call, prompt versions in use, failed and fallback calls |
-| Mahjong: judge and evals | Judge calibration over time, the fixed positions over time, the judge's own speed and tokens |
+| Mahjong: judge and evals | The fixed positions over time and the cost of test runs (the retired judge's tiles sit below, unused) |
 
 The first three read real games only. The fourth reads test runs only. Before adding a widget, the script asks Langfuse the widget's question read-only, so a query that Langfuse would reject is caught before anything is created. Code: [`AI_Observability/langfuse_setup.py`](AI_Observability/langfuse_setup.py).
 
@@ -659,7 +656,7 @@ flowchart LR
     login --> update["Point the Container App<br/>at the new image"]
 ```
 
-Every change goes through a pull request (30 so far), and CI runs the Python linter and formatter, the test suite (313 tests today), the web build and a Bicep build. A merge to `main` deploys on its own, one deploy at a time: a concurrency group queues them, because Azure rejects an update while another is in progress. Changes to the infrastructure itself are deployed by hand. The deploy also stamps the image with its git commit and the word "production", which Langfuse records on every trace as the release and the environment. Files: [`ci.yml`](Cloud_Infrastructure/ci.yml), [`deploy.yml`](Cloud_Infrastructure/deploy.yml), [`Dockerfile`](Cloud_Infrastructure/Dockerfile).
+Every change goes through a pull request (32 so far), and CI runs the Python linter and formatter, the test suite (302 tests today), the web build and a Bicep build. A merge to `main` deploys on its own, one deploy at a time: a concurrency group queues them, because Azure rejects an update while another is in progress. Changes to the infrastructure itself are deployed by hand. The deploy also stamps the image with its git commit and the word "production", which Langfuse records on every trace as the release and the environment. Files: [`ci.yml`](Cloud_Infrastructure/ci.yml), [`deploy.yml`](Cloud_Infrastructure/deploy.yml), [`Dockerfile`](Cloud_Infrastructure/Dockerfile).
 
 ### What it costs
 
@@ -668,7 +665,7 @@ Keeping this cheap was a design goal, not an accident:
 - **Scale to zero** means the container costs nothing between games.
 - **GitHub's registry instead of Azure Container Registry** saves about $5 a month.
 - **Free tier speech**, and a rules-first parser so most lines never reach a model.
-- **The strategist only runs when asked**, at low effort with prompt caching.
+- **The strategist only runs when asked**, at low effort with prompt caching, and the game review only when I press the button.
 
 Idle cost is well under a dollar a month, and the AI calls come to cents per game.
 
@@ -679,9 +676,9 @@ Idle cost is well under a dollar a month, and the AI calls come to cents per gam
 | Path | What it is |
 | --- | --- |
 | [`LLM_Orchestration/`](LLM_Orchestration/) | The strategist agent and its tests, photo reading, card drafting, the table-talk pipeline and the Jev client. |
-| [`AI_Observability/`](AI_Observability/) | The tracing module, the local judge and its labelled test answers, the drift report, the fixed test sets, the Langfuse setup kept in code, the play-by-play recorder, and the scripts and tests that go with them. |
+| [`AI_Observability/`](AI_Observability/) | The tracing module, the game review and the engine replay behind it, the drift report, the fixed test set, the Langfuse setup kept in code, the play-by-play recorder, and the scripts and tests that go with them. |
 | [`Cloud_Infrastructure/`](Cloud_Infrastructure/) | The Bicep file, Dockerfile, CI and deploy workflows, blob storage access and the speech token endpoint. |
-| [`Design_Decisions/`](Design_Decisions/) | The seven short decision records behind the design. |
+| [`Design_Decisions/`](Design_Decisions/) | The eight short decision records behind the design. |
 | [`Images/`](Images/) | Screenshots of the app running on the made-up sample card. |
 
 The source files are copies from the private repository. Each is marked at the top with where it came from, and they are otherwise unchanged except for one example line in the card-drafting prompt, which was swapped for a made-up one.
@@ -705,13 +702,14 @@ Each of these is a short record in [`Design_Decisions/`](Design_Decisions/).
 4. [Jev for the game-talk filter, Claude for the hand pick](Design_Decisions/0004-jev-for-typed-decisions.md)
 5. [Cards are TOML files in a notation that mirrors the printed card](Design_Decisions/0005-card-format.md)
 6. [One container behind Microsoft sign-in, image in GitHub's registry](Design_Decisions/0006-one-container-behind-sign-in.md)
-7. [Measure every AI step the same way, and judge it with a local model](Design_Decisions/0007-measure-the-ai-and-judge-it-locally.md)
+7. [Measure every AI step the same way, and judge it with a local model](Design_Decisions/0007-measure-the-ai-and-judge-it-locally.md) (the judge part replaced by 8)
+8. [Review a finished game with Claude, instead of judging picks with a local model](Design_Decisions/0008-review-a-finished-game-with-claude.md)
 
 ## Where it stands
 
 The engine, the tap-only app, the strategist, photo reading, card drafting and live listening are all built and deployed, and I have played full games with it. The observability layer in Part 2 is built too, and its Langfuse side (score definitions, prompts, datasets, dashboards) is live. What is next:
 
-- **Calibrate the judge on my desktop.** The judge is written and tested against a stand-in for Ollama, but it has not graded anything with the real model yet. Its first calibration run decides whether Gemma 4 12B is fit to judge, or whether the rubric or my labels need work first.
+- **Score real games.** Score My Game is built and tested with a stand-in for Claude. The first real reviews will show what one costs and how long it takes, and my "Useful?" taps will show whether it is worth it.
 - **A first run of the fixed positions**, to set the baseline that every later run is compared with.
 - **A trained tile detector.** Claude's vision is the baseline. Every rack photo is saved with the tiles I confirmed, so the training set is building itself, and the `tile_cv_correct` score is the bar a detector has to beat.
 - **Polish**, guided by the scores from real games.

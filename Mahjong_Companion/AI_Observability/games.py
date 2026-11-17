@@ -3,13 +3,16 @@
 """Game routes: start a game, add events, undo or fix them, and read the state with advice.
 
 Each game is one JSON file in the store (``games/<id>.json``) holding its event list; the state is
-replayed from the events on every read, so an undo or a fix is just an edited list.
+replayed from the events on every read, so an undo or a fix is just an edited list. What the AI
+said about a game (the strategist's picks and the game review) is kept beside it
+(``mahjong_api.notes``).
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import secrets
 import tomllib
@@ -27,10 +30,11 @@ from mahjong_engine.reads import Read, read_opponent
 from mahjong_engine.tiles import Tile
 from pydantic import BaseModel, Field
 
-from mahjong_api import jev, listen, playbyplay, strategist, vision
+from mahjong_api import jev, listen, notes, playbyplay, review, strategist, vision
 from mahjong_api.observability import flush, langfuse_client, record_score
 from mahjong_api.store import Store, store_from_env
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/games")
 cards_router = APIRouter(prefix="/api/cards")
 _cards: dict[str, Card] = {}
@@ -114,6 +118,8 @@ def create_game(body: NewGame, store: StoreDep) -> dict[str, Any]:
 def list_games(store: StoreDep) -> list[dict[str, Any]]:
     games = []
     for name in reversed(store.list("games")):
+        if notes.is_notes(name):
+            continue
         game_id = name.removeprefix("games/").removesuffix(".json")
         game = _load(store, game_id)
         state = game.state()
@@ -187,33 +193,101 @@ def ask_strategist(game_id: str, store: StoreDep, claude: ClaudeDep) -> dict[str
         raise HTTPException(502, str(e)) from e
     except anthropic.APIError as e:
         raise HTTPException(502, f"Claude API error: {e}") from e
+    # Kept with the game for the game review. The pick is the answer; losing the note isn't.
+    try:
+        ask = notes.add_ask(
+            store, game_id, len(game.events), pick.hand_id, pick.label, pick.reason, pick.trace_id
+        )
+    except Exception:
+        log.warning("Couldn't keep a strategist pick with game %s", game_id, exc_info=True)
+        ask = None
     return {
         "hand_id": pick.hand_id,
         "label": pick.label,
         "reason": pick.reason,
         "trace_id": pick.trace_id,
+        "ask": ask,
     }
 
 
 class Feedback(BaseModel):
-    trace_id: str
+    trace_id: str | None = None
     hand_id: str
     followed: bool
+    ask: int | None = None  # the pick's number in the game, as the ask returned it
 
 
 @router.post("/{game_id}/strategist/feedback")
-def strategist_feedback(game_id: str, body: Feedback) -> dict[str, bool]:
-    """Record whether the player went for the strategist's pick, as a Langfuse score. One per
-    ask: changing your mind overwrites it."""
-    record_score(
-        langfuse_client(),
-        "recommendation_followed",
-        body.followed,
-        trace_id=body.trace_id,
-        score_id=f"{body.trace_id}-recommendation_followed",
-        metadata={"game": game_id, "hand_id": body.hand_id},
-    )
-    flush()
+def strategist_feedback(game_id: str, body: Feedback, store: StoreDep) -> dict[str, bool]:
+    """Record whether the player went for the strategist's pick: with the game, for the game
+    review, and as a Langfuse score. One per ask: changing your mind overwrites it."""
+    kept = notes.mark_followed(store, game_id, body.followed, ask=body.ask, trace_id=body.trace_id)
+    if body.trace_id:
+        record_score(
+            langfuse_client(),
+            "recommendation_followed",
+            body.followed,
+            trace_id=body.trace_id,
+            score_id=f"{body.trace_id}-recommendation_followed",
+            metadata={"game": game_id, "hand_id": body.hand_id},
+        )
+        flush()
+    return {"recorded": kept or bool(body.trace_id)}
+
+
+@router.get("/{game_id}/review")
+def get_review(game_id: str, store: StoreDep) -> dict[str, Any]:
+    """The game's review, if it has been scored. ``review.moves`` below the game's move count
+    means the game changed after it was reviewed."""
+    _load(store, game_id)  # 404 for an unknown game
+    return {"review": notes.load(store, game_id)["review"]}
+
+
+@router.post("/{game_id}/review")
+def review_game(game_id: str, store: StoreDep, claude: ClaudeDep) -> dict[str, Any]:
+    """Score My Game: Claude's review of a finished game, kept with it. Asking again replaces
+    the review."""
+    if claude is None:
+        raise HTTPException(503, "Game reviews aren't set up: no ANTHROPIC_API_KEY")
+    game = _load(store, game_id)
+    state = game.state()
+    if state.phase != "over":
+        raise HTTPException(400, "Score your game once it's over")
+    card = load_card(store, card_for(game, ME))
+    if card is None:
+        raise HTTPException(503, "No card loaded")
+    opponents = {}
+    for player in range(2, game.players + 1):
+        if (theirs := load_card(store, card_for(game, player))) is not None:
+            opponents[player] = theirs
+    kept = notes.load(store, game_id)
+    import anthropic
+
+    try:
+        result = review.review_game(claude, card, game, game_id, kept["asks"], opponents)
+    except review.ReviewError as e:
+        raise HTTPException(502, str(e)) from e
+    except anthropic.APIError as e:
+        raise HTTPException(502, f"Claude API error: {e}") from e
+    kept["review"] = result
+    notes.save(store, game_id, kept)
+    return {"review": result}
+
+
+class ReviewFeedback(BaseModel):
+    useful: bool
+
+
+@router.post("/{game_id}/review/feedback")
+def review_feedback(game_id: str, body: ReviewFeedback, store: StoreDep) -> dict[str, bool]:
+    """The player's "Useful" / "Not useful" tap on the review (Langfuse ``review_helpful``)."""
+    kept = notes.load(store, game_id)
+    if kept["review"] is None:
+        raise HTTPException(404, "This game hasn't been scored")
+    kept["review"]["helpful"] = body.useful
+    notes.save(store, game_id, kept)
+    if trace_id := kept["review"].get("trace_id"):
+        review.score_helpful(trace_id, body.useful)
     return {"recorded": True}
 
 
